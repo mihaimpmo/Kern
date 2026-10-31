@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = ["ulib", "init", "hello", "crash", "spin"]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
