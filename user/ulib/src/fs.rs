@@ -21,6 +21,8 @@ pub mod flags {
     pub const APPEND: u64 = 0x400;
     /// Fail unless it is a directory.
     pub const DIRECTORY: u64 = 0x1_0000;
+    /// Don't pass the descriptor on to spawned children (O_CLOEXEC).
+    pub const CLOSE_ON_SPAWN: u64 = 0x8_0000;
 }
 
 /// Longest name of a directory entry.
@@ -55,14 +57,23 @@ pub enum Kind {
     File,
     Dir,
     Device,
+    Pipe,
 }
 
 fn kind_from(code: u64) -> Kind {
     match code {
         1 => Kind::File,
         2 => Kind::Dir,
+        4 => Kind::Pipe,
         _ => Kind::Device,
     }
+}
+
+/// A new pipe: (read end, write end). `flags` is 0 or CLOSE_ON_SPAWN.
+pub fn pipe(flags: u64) -> Result<(Fd, Fd), Errno> {
+    let mut fds = [0u64; 2];
+    check(unsafe { syscall(sys::PIPE, fds.as_mut_ptr() as u64, flags, 0) })?;
+    Ok((fds[0], fds[1]))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -104,9 +115,10 @@ pub fn getcwd(buf: &mut [u8]) -> Result<&str, Errno> {
     core::str::from_utf8(&buf[..n]).map_err(|_| Errno::EINVAL)
 }
 
-/// Another descriptor for the same open file (sharing its offset).
-pub fn dup(fd: Fd) -> Result<Fd, Errno> {
-    check(unsafe { syscall(sys::DUP, fd, 0, 0) })
+/// Another descriptor for the same open file (sharing its offset). `flags`
+/// is 0 or CLOSE_ON_SPAWN.
+pub fn dup(fd: Fd, flags: u64) -> Result<Fd, Errno> {
+    check(unsafe { syscall(sys::DUP, fd, flags, 0) })
 }
 
 /// Make `new_fd` refer to `fd`'s open file, closing what `new_fd` was.

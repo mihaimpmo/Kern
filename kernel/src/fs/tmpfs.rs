@@ -84,7 +84,7 @@ impl Inode for Dir {
         let inode: Arc<dyn Inode> = match kind {
             Kind::File => Arc::new(File { data: Mutex::new(Vec::new()) }),
             Kind::Dir => Arc::new(Dir::new()),
-            Kind::Device => return Err(FsError::Invalid),
+            Kind::Device | Kind::Pipe => return Err(FsError::Invalid),
         };
         self.attach(name, inode.clone())?;
         Ok(inode)

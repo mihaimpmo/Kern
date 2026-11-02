@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["ulib", "init", "hello", "crash", "spin", "selftest", "ls", "cat", "mkdir", "rm"]
+members = ["ulib", "init", "hello", "crash", "spin", "selftest", "ls", "cat", "mkdir", "rm", "echo", "ps", "sleep", "kill", "date", "wc"]
 
 [profile.dev]
 panic = "abort"

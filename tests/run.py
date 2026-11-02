@@ -75,21 +75,23 @@ def run_selftest(iso, cpu, smp, workdir):
 # ---------------------------------------------------------------- shell test
 
 KEYS = {" ": "spc", "&": "shift-7", "-": "minus", ".": "dot", "/": "slash", "_": "shift-minus",
-        ">": "shift-dot", "<": "shift-comma"}
-TOKENS = {"<up>": "up", "<down>": "down", "<esc>": "esc", "<bs>": "backspace"}
+        ">": "shift-dot", "<": "shift-comma", "|": "shift-backslash"}
+TOKENS = {"<up>": "up", "<down>": "down", "<esc>": "esc", "<bs>": "backspace", "<ctrl-c>": "ctrl-c"}
 
 # (what to type, regex that must newly appear in the output). Typed text is
 # followed by Enter unless it ends in a key token. PROMPT matches any prompt,
 # for commands whose effect is checked by a later step.
 PROMPT = r"kern:\S*> "
+# A step that just waits a moment.
+PAUSE = "<pause>"
 SHELL_STEPS = [
     ("echo hello   world", r"^hello world$"),
     ("hello 2", r"hello from process \d+ \(2/2\)"),
     ("hello x", r"usage: hello \[count\]"),
-    ("crash", r"exited with code -142"),
+    ("crash", r"killed by SIGSEGV"),
     ("no-such-thing", r"no-such-thing: command not found"),
     ("<up><up>", r"kern:/> crash$"),        # history recall redraws the line
-    ("", r"exited with code -142"),          # ...and Enter runs it again
+    ("", r"killed by SIGSEGV"),              # ...and Enter runs it again
     ("history", r"^\s+\d+\s+no-such-thing$"),
     ("hello 1 &", r"\[\d+\] started in background"),
     ("ps", r"PID\s+PPID\s+STATE\s+CPU\s+NAME"),
@@ -106,6 +108,23 @@ SHELL_STEPS = [
     ("rm note dir", PROMPT),
     ("cat note", r"cat: note: no such file or directory"),
     ("cd nowhere", r"cd: nowhere: no such file or directory"),
+    ("echo piped words | cat", r"^piped words$"),
+    ("ls /bin | wc -l", r"^15$"),
+    ("echo a b c | cat | wc -w", r"^3$"),
+    ("date", r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d UTC$"),
+    # Ctrl+C interrupts the foreground job (once it has started: a key
+    # pressed before that is just input, as on any terminal)...
+    ("sleep 100", r"> sleep 100$"),
+    (PAUSE, None),
+    ("<ctrl-c>", r"^\^C$"),
+    ("cat", r"> cat$"),
+    (PAUSE, None),
+    ("<ctrl-c>", r"^\^C$"),
+    ("echo partial<ctrl-c>", r"echo partial\^C$"),  # ...or abandons the line
+    ("spin | wc -l", r"> spin \| wc -l$"),
+    (PAUSE, None),
+    ("<ctrl-c>", r"^\^C$"),                 # every process in the pipeline
+    ("ps | wc -l", r"^4$"),                  # header, init, ps, wc: nothing left over
 ]
 
 
@@ -152,6 +171,9 @@ def run_shell(iso, workdir):
             print(indent(read_log(log)))
             return False
         for typed, expect in SHELL_STEPS:
+            if typed == PAUSE:
+                time.sleep(1)
+                continue
             seen = count(expect, read_log(log))
             for key in keys_for(typed):
                 monitor("sendkey " + key)
@@ -164,7 +186,7 @@ def run_shell(iso, workdir):
                 ok = False
                 break
         if ok:
-            print(f"  shell: {len(SHELL_STEPS)} steps passed")
+            print(f"  shell: {sum(t != PAUSE for t, _ in SHELL_STEPS)} steps passed")
     finally:
         monitor("quit")
         try:

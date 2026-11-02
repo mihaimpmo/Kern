@@ -23,7 +23,20 @@
 //!   22 readdir(fd, buf, len) -> bytes     (kind byte + name; 0 at the end)
 //!   23 mkdir(path, len)                   24 unlink(path, len)
 //!   25 chdir(path, len)                   26 getcwd(buf, len) -> bytes
-//!   27 dup(fd) -> fd                      28 dup2(fd, new_fd) -> new_fd
+//!   27 dup(fd, flags) -> fd               28 dup2(fd, new_fd) -> new_fd
+//!   29 pipe(fds: *mut [u64; 2], flags)    (read end, write end)
+//!
+//! Descriptors opened with O_CLOEXEC (open, pipe, dup) aren't passed on to
+//! spawned children; dup2 always makes an inheritable one.
+//!
+//! Signals and time (process.rs):
+//!   30 kill(pid, signal)        pid > 0 a process, < 0 a group, 0 our group
+//!   31 setpgid(pid, pgid)       32 set_foreground(pgid)   (Ctrl+C target)
+//!   33 time_ms() -> milliseconds since 1970 (UTC)
+//!
+//! Exit statuses (wait, try_wait) are the exit code in the low 32 bits, or
+//! 1 << 32 | signal for a process that was killed. Every signal kills; CPU
+//! faults in user mode raise SIGSEGV, SIGILL, SIGFPE, ...
 //!
 //! (9 was `programs`, replaced by reading /bin.) Strings are (pointer,
 //! length) pairs, never NUL-terminated; `argv` points to `argc` such pairs,
@@ -42,7 +55,7 @@ use crate::arch::gdt;
 use crate::fs::FsError;
 use crate::mm::uspace::{MemError, UserSpace};
 use crate::mm::vmm;
-use crate::task::{self, exec::LoadError};
+use crate::task::{self, exec::LoadError, signal, ExitStatus};
 use alloc::{string::String, vec, vec::Vec};
 use core::arch::global_asm;
 
@@ -50,7 +63,10 @@ use core::arch::global_asm;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Errno(i64);
 
+pub const EPERM: Errno = Errno(1);
 pub const ENOENT: Errno = Errno(2);
+pub const ESRCH: Errno = Errno(3);
+pub const EINTR: Errno = Errno(4);
 pub const E2BIG: Errno = Errno(7);
 pub const ENOEXEC: Errno = Errno(8);
 pub const EBADF: Errno = Errno(9);
@@ -59,6 +75,7 @@ pub const ENOMEM: Errno = Errno(12);
 pub const EFAULT: Errno = Errno(14);
 pub const EEXIST: Errno = Errno(17);
 pub const ENOTDIR: Errno = Errno(20);
+pub const EPIPE: Errno = Errno(32);
 pub const ERANGE: Errno = Errno(34);
 pub const EISDIR: Errno = Errno(21);
 pub const EINVAL: Errno = Errno(22);
@@ -80,6 +97,8 @@ impl From<FsError> for Errno {
             FsError::BadFd => EBADF,
             FsError::TooManyFiles => EMFILE,
             FsError::NoMemory => ENOMEM,
+            FsError::Interrupted => EINTR,
+            FsError::BrokenPipe => EPIPE,
         }
     }
 }
@@ -201,7 +220,7 @@ extern "C" fn syscall_dispatch(f: &mut SyscallFrame) {
     cpu::sti();
     let (a0, a1, a2, a3) = (f.rdi, f.rsi, f.rdx, f.r10);
     let result: SysResult = match f.rax {
-        0 => task::exit_current(a0 as i64),
+        0 => task::exit_current(ExitStatus::Exited(a0 as i32)),
         1 => file::write(a0, a1, a2),
         2 => file::read(a0, a1, a2),
         3 => Ok(task::current_pid()),
@@ -233,8 +252,13 @@ extern "C" fn syscall_dispatch(f: &mut SyscallFrame) {
         24 => file::unlink(a0, a1),
         25 => file::chdir(a0, a1),
         26 => file::getcwd(a0, a1),
-        27 => file::dup(a0),
+        27 => file::dup(a0, a1),
         28 => file::dup2(a0, a1),
+        29 => file::pipe(a0, a1),
+        30 => process::kill(a0, a1),
+        31 => process::setpgid(a0, a1),
+        32 => process::set_foreground(a0),
+        33 => process::time_ms(),
         _ => Err(ENOSYS),
     };
     f.rax = match result {
@@ -244,8 +268,9 @@ extern "C" fn syscall_dispatch(f: &mut SyscallFrame) {
 
     // sysret to a non-canonical address would fault in ring 0.
     if f.rip >= vmm::USER_END {
-        task::exit_current(-1);
+        task::exit_current(ExitStatus::Killed(signal::SIGSEGV));
     }
+    task::deliver_signals();
     f.rflags = (f.rflags & !0x3000) | 0x200; // IOPL 0, interrupts on
 }
 

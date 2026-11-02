@@ -2,6 +2,7 @@
 
 use crate::arch::{apic, cpu, smp};
 use crate::cmdline;
+use crate::task::ExitStatus;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 /// QEMU's isa-debug-exit device: writing `v` exits QEMU with status `(v << 1) | 1`.
@@ -28,15 +29,25 @@ pub fn halting() -> bool {
 }
 
 /// Pid 1 exited. There is no one left to adopt orphans or run a shell, so stop.
-pub fn init_exited(code: i64) -> ! {
+pub fn init_exited(status: ExitStatus) -> ! {
     cpu::cli();
     if !stop_other_cpus() {
         cpu::halt_forever();
     }
-    kprintln!("\n[kernel] init exited with code {}; system halted", code);
+    // QEMU's exit status carries 7 bits; a killed init reads as 128 + signal.
+    let code = match status {
+        ExitStatus::Exited(code) => {
+            kprintln!("\n[kernel] init exited with code {}; system halted", code);
+            code as u32
+        }
+        ExitStatus::Killed(sig) => {
+            kprintln!("\n[kernel] init killed by signal {}; system halted", sig);
+            128 + sig as u32
+        }
+    };
     crate::drivers::serial::stop_buffering(); // the timer won't drain it any more
     if cmdline::flag("qemu-exit") {
-        unsafe { cpu::outl(QEMU_DEBUG_EXIT, code as u32) };
+        unsafe { cpu::outl(QEMU_DEBUG_EXIT, code) };
     }
     cpu::halt_forever();
 }

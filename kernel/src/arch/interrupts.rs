@@ -2,7 +2,8 @@
 
 use super::{apic, cpu, percpu};
 use crate::mm::uspace::FaultResult;
-use crate::{drivers::keyboard, drivers::serial, task};
+use crate::task::{self, signal, ExitStatus};
+use crate::{drivers::keyboard, drivers::serial};
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -133,6 +134,12 @@ extern "C" fn interrupt_dispatch(frame: &mut InterruptFrame) {
             apic::eoi();
         }
     }
+    // About to return to user mode: act on signals sent meanwhile (from
+    // another CPU, Ctrl+C, ...). This is what stops a process that never
+    // makes a system call.
+    if frame.from_user() {
+        task::deliver_signals();
+    }
 }
 
 /// NMIs received so far, and how many of them have been reported.
@@ -190,7 +197,7 @@ fn exception(frame: &mut InterruptFrame) {
         } else {
             kprintln!("\x1b[91m[kernel] process {} killed: {} at {:#x}\x1b[0m", pid, name, frame.rip);
         }
-        task::exit_current(-(128 + frame.vector as i64));
+        task::exit_current(ExitStatus::Killed(fault_signal(frame.vector)));
     }
 
     if frame.vector == 14 {
@@ -200,6 +207,17 @@ fn exception(frame: &mut InterruptFrame) {
         );
     }
     panic!("{} in kernel at {:#x} (error {:#x})\n{:#x?}", name, frame.rip, frame.error, frame);
+}
+
+/// The signal a CPU fault in user mode kills the process with.
+fn fault_signal(vector: u64) -> u8 {
+    match vector {
+        0 | 16 | 19 => signal::SIGFPE, // divide error, x87 / SIMD floating point
+        1 | 3 => signal::SIGTRAP,      // debug, breakpoint
+        6 => signal::SIGILL,           // invalid opcode
+        17 => signal::SIGBUS,          // alignment check
+        _ => signal::SIGSEGV,          // page fault, general protection, ...
+    }
 }
 
 // Page-fault error code bits.

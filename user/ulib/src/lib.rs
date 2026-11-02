@@ -46,6 +46,11 @@ pub mod sys {
     pub const GETCWD: u64 = 26;
     pub const DUP: u64 = 27;
     pub const DUP2: u64 = 28;
+    pub const PIPE: u64 = 29;
+    pub const KILL: u64 = 30;
+    pub const SETPGID: u64 = 31;
+    pub const SET_FOREGROUND: u64 = 32;
+    pub const TIME_MS: u64 = 33;
 }
 
 /// Raw system call: number in rax, up to six arguments, result in rax.
@@ -76,7 +81,10 @@ pub(crate) unsafe fn syscall(n: u64, a0: u64, a1: u64, a2: u64) -> i64 {
 pub struct Errno(pub i64);
 
 impl Errno {
+    pub const EPERM: Errno = Errno(1);
     pub const ENOENT: Errno = Errno(2);
+    pub const ESRCH: Errno = Errno(3);
+    pub const EINTR: Errno = Errno(4);
     pub const E2BIG: Errno = Errno(7);
     pub const ENOEXEC: Errno = Errno(8);
     pub const EBADF: Errno = Errno(9);
@@ -88,6 +96,7 @@ impl Errno {
     pub const EISDIR: Errno = Errno(21);
     pub const EINVAL: Errno = Errno(22);
     pub const EMFILE: Errno = Errno(24);
+    pub const EPIPE: Errno = Errno(32);
     pub const ERANGE: Errno = Errno(34);
     pub const ENAMETOOLONG: Errno = Errno(36);
     pub const ENOSYS: Errno = Errno(38);
@@ -95,7 +104,10 @@ impl Errno {
 
     pub fn name(self) -> &'static str {
         match self.0 {
+            1 => "not permitted",
             2 => "no such file or directory",
+            3 => "no such process",
+            4 => "interrupted",
             7 => "argument list too long",
             8 => "not an executable",
             9 => "bad file descriptor",
@@ -107,6 +119,7 @@ impl Errno {
             21 => "is a directory",
             22 => "invalid argument",
             24 => "too many open files",
+            32 => "broken pipe",
             34 => "buffer too small",
             36 => "name too long",
             38 => "not implemented",
@@ -170,18 +183,102 @@ pub fn spawn(name: &str, args: &[&str]) -> Result<Pid, Errno> {
     check(ret)
 }
 
-/// Wait for child `pid` to finish and return its exit code.
-pub fn wait(pid: Pid) -> Result<i64, Errno> {
-    let mut code: i64 = 0;
-    check(unsafe { syscall(sys::WAIT, pid, &mut code as *mut i64 as u64, 0) })?;
-    Ok(code)
+/// How a process ended.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ExitStatus {
+    Exited(i32),
+    /// Killed by this signal (see `signal`).
+    Killed(u8),
 }
 
-/// Collect any finished child without blocking: Some((pid, exit code)).
-pub fn try_wait() -> Option<(Pid, i64)> {
-    let mut code: i64 = 0;
-    let pid = unsafe { syscall(sys::TRY_WAIT, &mut code as *mut i64 as u64, 0, 0) };
-    (pid > 0).then_some((pid as Pid, code))
+impl ExitStatus {
+    fn decode(raw: u64) -> ExitStatus {
+        if raw >> 32 == 1 {
+            ExitStatus::Killed(raw as u8)
+        } else {
+            ExitStatus::Exited(raw as u32 as i32)
+        }
+    }
+
+    pub fn success(self) -> bool {
+        self == ExitStatus::Exited(0)
+    }
+}
+
+impl fmt::Display for ExitStatus {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            ExitStatus::Exited(code) => write!(f, "exit code {}", code),
+            ExitStatus::Killed(sig) => write!(f, "killed by {}", signal::name(sig)),
+        }
+    }
+}
+
+/// Wait for child `pid` to end.
+pub fn wait(pid: Pid) -> Result<ExitStatus, Errno> {
+    let mut raw: u64 = 0;
+    check(unsafe { syscall(sys::WAIT, pid, &mut raw as *mut u64 as u64, 0) })?;
+    Ok(ExitStatus::decode(raw))
+}
+
+/// Collect any ended child without blocking: Some((pid, status)).
+pub fn try_wait() -> Option<(Pid, ExitStatus)> {
+    let mut raw: u64 = 0;
+    let pid = unsafe { syscall(sys::TRY_WAIT, &mut raw as *mut u64 as u64, 0, 0) };
+    (pid > 0).then(|| (pid as Pid, ExitStatus::decode(raw)))
+}
+
+/// Signals (Linux numbers). Every signal kills the process it is sent to.
+pub mod signal {
+    pub const SIGINT: u8 = 2;
+    pub const SIGILL: u8 = 4;
+    pub const SIGTRAP: u8 = 5;
+    pub const SIGBUS: u8 = 7;
+    pub const SIGFPE: u8 = 8;
+    pub const SIGKILL: u8 = 9;
+    pub const SIGSEGV: u8 = 11;
+    pub const SIGTERM: u8 = 15;
+
+    pub fn name(sig: u8) -> &'static str {
+        match sig {
+            SIGINT => "SIGINT",
+            SIGILL => "SIGILL",
+            SIGTRAP => "SIGTRAP",
+            SIGBUS => "SIGBUS",
+            SIGFPE => "SIGFPE",
+            SIGKILL => "SIGKILL",
+            SIGSEGV => "SIGSEGV",
+            SIGTERM => "SIGTERM",
+            _ => "a signal",
+        }
+    }
+
+    /// "INT", "SIGINT" or "2" -> 2.
+    pub fn parse(s: &str) -> Option<u8> {
+        if let Ok(n) = s.parse::<u8>() {
+            return (1..=31).contains(&n).then_some(n);
+        }
+        let s = s.strip_prefix("SIG").unwrap_or(s);
+        [SIGINT, SIGILL, SIGTRAP, SIGBUS, SIGFPE, SIGKILL, SIGSEGV, SIGTERM].into_iter().find(|&n| &name(n)[3..] == s)
+    }
+}
+
+/// Send `sig` to process `pid` (> 0), process group `-pid` (< 0), or our
+/// own process group (0).
+pub fn kill(pid: i64, sig: u8) -> Result<(), Errno> {
+    check(unsafe { syscall(sys::KILL, pid as u64, sig as u64, 0) }).map(|_| ())
+}
+
+/// Move process `pid` (0: ourselves) into process group `pgid` (0: a new
+/// group with the same number as `pid`).
+pub fn setpgid(pid: Pid, pgid: Pid) -> Result<(), Errno> {
+    check(unsafe { syscall(sys::SETPGID, pid, pgid, 0) }).map(|_| ())
+}
+
+/// Make Ctrl+C on the console send SIGINT to process group `pgid` (0: no
+/// one; the key then arrives as byte 3).
+pub fn set_foreground(pgid: Pid) {
+    unsafe { syscall(sys::SET_FOREGROUND, pgid, 0, 0) };
 }
 
 // ------------------------------------------------------------------- time
@@ -196,6 +293,12 @@ pub fn yield_now() {
 
 pub fn uptime_ms() -> u64 {
     unsafe { syscall(sys::UPTIME_MS, 0, 0, 0) as u64 }
+}
+
+/// Milliseconds since 1970-01-01 UTC, or 0 if the machine's clock couldn't
+/// be read.
+pub fn time_ms() -> u64 {
+    unsafe { syscall(sys::TIME_MS, 0, 0, 0) as u64 }
 }
 
 // -------------------------------------------------------------------- I/O

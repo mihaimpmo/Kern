@@ -1,6 +1,6 @@
 //! Devices in /dev.
 
-use super::{Inode, Kind, Result};
+use super::{FsError, Inode, Kind, Result};
 use crate::drivers::{keyboard, serial};
 
 /// The keyboard (reading) and screen + serial port (writing).
@@ -11,9 +11,9 @@ impl Inode for Console {
         Kind::Device
     }
 
-    /// Blocks until at least one key is available.
+    /// Blocks until at least one key is available (or a signal arrives).
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<usize> {
-        Ok(keyboard::read(buf))
+        keyboard::read(buf).map_err(|_| FsError::Interrupted)
     }
 
     fn write_at(&self, _offset: u64, buf: &[u8]) -> Result<usize> {

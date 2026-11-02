@@ -6,7 +6,18 @@
 use crate::acpi::Madt;
 use crate::arch::{apic, cpu::{inb, outb}, interrupts::VECTOR_KEYBOARD};
 use crate::sync::SpinLock;
-use crate::task::WaitQueue;
+use crate::task::{self, signal, Interrupted, KillTarget, Pid, WaitQueue};
+use core::sync::atomic::{AtomicU64, Ordering};
+
+const CTRL_C: u8 = 3;
+
+/// Process group that Ctrl+C interrupts (0: none, the key is delivered as
+/// byte 3 instead). Set by the shell around each foreground job.
+static FOREGROUND: AtomicU64 = AtomicU64::new(0);
+
+pub fn set_foreground(group: Pid) {
+    FOREGROUND.store(group, Ordering::Relaxed);
+}
 
 const DATA: u16 = 0x60;
 const STATUS: u16 = 0x64;
@@ -144,6 +155,15 @@ pub fn handle_interrupt() {
                 c = c.to_ascii_lowercase() - b'a' + 1; // Ctrl+C = 3, ...
             }
             drop(mods);
+            if c == CTRL_C {
+                let group = FOREGROUND.load(Ordering::Relaxed);
+                if group != 0 {
+                    // A job is running in the foreground: interrupt it rather
+                    // than give it the key.
+                    let _ = task::kill(KillTarget::Group(group), signal::SIGINT);
+                    return;
+                }
+            }
             if c != 0 {
                 push_bytes(&[c]);
             }
@@ -165,10 +185,11 @@ fn push_bytes(bytes: &[u8]) {
     READERS.wake_all();
 }
 
-/// Read up to `out.len()` bytes, blocking until at least one is available.
-pub fn read(out: &mut [u8]) -> usize {
+/// Read up to `out.len()` bytes, blocking until at least one is available
+/// or a signal arrives.
+pub fn read(out: &mut [u8]) -> Result<usize, Interrupted> {
     if out.is_empty() {
-        return 0;
+        return Ok(0);
     }
     let mut buf = BUFFER.lock();
     loop {
@@ -183,8 +204,8 @@ pub fn read(out: &mut [u8]) -> usize {
             }
         }
         if n > 0 {
-            return n;
+            return Ok(n);
         }
-        buf = READERS.wait(buf);
+        buf = READERS.wait_interruptible(buf)?;
     }
 }

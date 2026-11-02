@@ -11,6 +11,7 @@
 
 pub mod dev;
 pub mod initramfs;
+pub mod pipe;
 pub mod tmpfs;
 
 use crate::sync::{Mutex, SpinLock};
@@ -21,6 +22,7 @@ pub enum Kind {
     File,
     Dir,
     Device,
+    Pipe,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -35,6 +37,10 @@ pub enum FsError {
     BadFd,
     TooManyFiles,
     NoMemory,
+    /// A signal arrived during a blocking read or write.
+    Interrupted,
+    /// Writing to a pipe nobody reads.
+    BrokenPipe,
 }
 
 pub type Result<T> = core::result::Result<T, FsError>;
@@ -210,6 +216,9 @@ pub mod flags {
     pub const TRUNCATE: u64 = 0x200;
     pub const APPEND: u64 = 0x400;
     pub const DIRECTORY: u64 = 0x1_0000;
+    /// O_CLOEXEC: don't pass the descriptor on to spawned children (also
+    /// accepted by `pipe`).
+    pub const CLOSE_ON_SPAWN: u64 = 0x8_0000;
 }
 
 /// An open file: the inode, how it was opened, and the current offset (for
@@ -310,9 +319,15 @@ pub fn open(cwd: &str, path: &str, how: u64) -> Result<Arc<OpenFile>> {
 pub const MAX_FDS: usize = 64;
 
 /// A process's file descriptors.
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub struct FdTable {
-    files: Vec<Option<Arc<OpenFile>>>,
+    slots: Vec<Option<Slot>>,
+}
+
+struct Slot {
+    file: Arc<OpenFile>,
+    /// Not passed on to spawned children (O_CLOEXEC).
+    close_on_spawn: bool,
 }
 
 impl FdTable {
@@ -320,46 +335,68 @@ impl FdTable {
     pub fn with_console() -> FdTable {
         let console = lookup("/", "/dev/console").expect("no /dev/console");
         let file = OpenFile::new(console, true, true, false);
-        FdTable { files: alloc::vec![Some(file.clone()), Some(file.clone()), Some(file)] }
+        let slot = || Some(Slot { file: file.clone(), close_on_spawn: false });
+        FdTable { slots: alloc::vec![slot(), slot(), slot()] }
+    }
+
+    /// The descriptors a spawned child starts with: the same open files,
+    /// minus those marked close-on-spawn.
+    pub fn for_child(&self) -> FdTable {
+        let slots = self
+            .slots
+            .iter()
+            .map(|s| match s {
+                Some(s) if !s.close_on_spawn => Some(Slot { file: s.file.clone(), close_on_spawn: false }),
+                _ => None,
+            })
+            .collect();
+        FdTable { slots }
     }
 
     pub fn get(&self, fd: u64) -> Result<Arc<OpenFile>> {
-        self.files.get(fd as usize).and_then(|f| f.clone()).ok_or(FsError::BadFd)
+        match self.slots.get(fd as usize) {
+            Some(Some(slot)) => Ok(slot.file.clone()),
+            _ => Err(FsError::BadFd),
+        }
     }
 
     /// Install `file` at the lowest free descriptor.
-    pub fn insert(&mut self, file: Arc<OpenFile>) -> Result<u64> {
-        let fd = match self.files.iter().position(|f| f.is_none()) {
+    pub fn insert(&mut self, file: Arc<OpenFile>, close_on_spawn: bool) -> Result<u64> {
+        let fd = match self.slots.iter().position(|s| s.is_none()) {
             Some(free) => free,
-            None if self.files.len() < MAX_FDS => {
-                self.files.push(None);
-                self.files.len() - 1
+            None if self.slots.len() < MAX_FDS => {
+                self.slots.push(None);
+                self.slots.len() - 1
             }
             None => return Err(FsError::TooManyFiles),
         };
-        self.files[fd] = Some(file);
+        self.slots[fd] = Some(Slot { file, close_on_spawn });
         Ok(fd as u64)
     }
 
-    /// Install `file` at `fd`; returns what was there, for the caller to
-    /// drop (close) after releasing the table's lock.
+    /// Install `file` at `fd` (inherited by children, as after `dup2`).
+    /// Returns what was there, for the caller to drop (close) after
+    /// releasing the table's lock.
     pub fn insert_at(&mut self, fd: u64, file: Arc<OpenFile>) -> Result<Option<Arc<OpenFile>>> {
         let fd = fd as usize;
         if fd >= MAX_FDS {
             return Err(FsError::BadFd);
         }
-        if self.files.len() <= fd {
-            self.files.resize(fd + 1, None);
+        if self.slots.len() <= fd {
+            self.slots.resize_with(fd + 1, || None);
         }
-        Ok(self.files[fd].replace(file))
+        Ok(self.slots[fd].replace(Slot { file, close_on_spawn: false }).map(|s| s.file))
     }
 
     pub fn close(&mut self, fd: u64) -> Result<Arc<OpenFile>> {
-        self.files.get_mut(fd as usize).and_then(|f| f.take()).ok_or(FsError::BadFd)
+        match self.slots.get_mut(fd as usize).and_then(|s| s.take()) {
+            Some(slot) => Ok(slot.file),
+            None => Err(FsError::BadFd),
+        }
     }
 
     /// Take every open file out, to be dropped by the caller.
     pub fn take_all(&mut self) -> Vec<Arc<OpenFile>> {
-        self.files.drain(..).flatten().collect()
+        self.slots.drain(..).flatten().map(|s| s.file).collect()
     }
 }

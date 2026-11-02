@@ -40,6 +40,41 @@ pub enum State {
     Zombie,
 }
 
+/// How a process ended.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ExitStatus {
+    Exited(i32),
+    /// Killed by this signal (sent with `kill`, or raised by a CPU fault).
+    Killed(u8),
+}
+
+impl ExitStatus {
+    /// As seen by user space: the exit code in the low 32 bits, or
+    /// 1 << 32 | signal for a killed process.
+    pub fn encode(self) -> u64 {
+        match self {
+            ExitStatus::Exited(code) => code as u32 as u64,
+            ExitStatus::Killed(signal) => 1 << 32 | signal as u64,
+        }
+    }
+}
+
+/// Signal numbers (Linux's). There are no handlers: every signal ends the
+/// process. The kernel raises only some of them itself; the rest are listed
+/// because user space sends them.
+#[allow(dead_code)]
+pub mod signal {
+    pub const SIGILL: u8 = 4;
+    pub const SIGTRAP: u8 = 5;
+    pub const SIGBUS: u8 = 7;
+    pub const SIGFPE: u8 = 8;
+    pub const SIGKILL: u8 = 9;
+    pub const SIGSEGV: u8 = 11;
+    pub const SIGINT: u8 = 2;
+    pub const SIGTERM: u8 = 15;
+    pub const MAX: u8 = 31;
+}
+
 pub struct Task {
     pub pid: Pid,
     pub name: String,
@@ -47,7 +82,9 @@ pub struct Task {
     pub parent: Option<Pid>,
     /// CPU the task is running on, while `state == Running`.
     pub cpu: Option<usize>,
-    exit_code: i64,
+    exit: ExitStatus,
+    /// A signal sent to the task and not yet acted on.
+    pending_signal: Option<u8>,
     rsp: u64,
     kstack: Option<KernelStack>,
     /// What the user process owns (None for kernel threads). Locked
@@ -70,7 +107,8 @@ impl Task {
             state: State::Ready,
             parent,
             cpu: None,
-            exit_code: 0,
+            exit: ExitStatus::Exited(0),
+            pending_signal: None,
             rsp: 0,
             kstack: None,
             process: None,
@@ -89,12 +127,15 @@ pub struct Process {
     pub files: SpinLock<FdTable>,
     /// Canonical absolute path of the working directory.
     pub cwd: SpinLock<String>,
+    /// Process group, for signalling a whole job (Ctrl+C).
+    pub pgid: AtomicU64,
 }
 
 /// What a new process starts with besides its program.
 pub struct Inherit {
     pub files: FdTable,
     pub cwd: String,
+    pub pgid: Pid,
 }
 
 /// What the scheduler knows about one CPU.
@@ -225,7 +266,7 @@ extern "C" fn task_start(arg: u64, entry: u64) -> ! {
     cpu::sti();
     let f: fn(u64) = unsafe { core::mem::transmute(entry as usize) };
     f(arg);
-    exit_current(0);
+    exit_current(ExitStatus::Exited(0));
 }
 
 /// Lay out a fresh kernel stack so that `switch_context` "returns" into
@@ -300,6 +341,7 @@ fn spawn_user(
         space: SpinLock::new(image.space),
         files: SpinLock::new(inherit.files),
         cwd: SpinLock::new(inherit.cwd),
+        pgid: AtomicU64::new(inherit.pgid),
     };
     let pid = add_task(name, parent, Some(process), user_task_entry, 0).ok_or(exec::LoadError::NoMemory)?;
     let mut s = SCHED.lock();
@@ -346,7 +388,7 @@ fn user_task_entry(_: u64) {
 
 /// Terminate the running task. Its memory is freed by the scheduler once
 /// we have switched away from its stack.
-pub fn exit_current(code: i64) -> ! {
+pub fn exit_current(status: ExitStatus) -> ! {
     // Close our files now, outside the scheduler lock: closing can wake
     // other tasks (the reader at the other end of a pipe, say).
     if let Some(process) = current_process() {
@@ -358,7 +400,7 @@ pub fn exit_current(code: i64) -> ! {
     assert!(pid != 0, "idle task tried to exit");
     if pid == 1 {
         drop(s);
-        crate::power::init_exited(code);
+        crate::power::init_exited(status);
     }
     // Orphan our children. A child still running, or exited but not yet
     // reaped, is removed by `reap` once it has no parent. A child that was
@@ -378,43 +420,116 @@ pub fn exit_current(code: i64) -> ! {
     });
     let t = s.current();
     t.state = State::Zombie;
-    t.exit_code = code;
+    t.exit = status;
     s.zombies.push(pid);
     CHILD_EXITED.wake_all_locked(&mut s);
     schedule(&mut s);
     unreachable!("zombie task was scheduled");
 }
 
-/// Wait for a child process to exit and return its exit code.
-pub fn wait(pid: Pid) -> Option<i64> {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WaitError {
+    NotChild,
+    /// A signal arrived while waiting.
+    Interrupted,
+}
+
+/// Wait for child `pid` to end and return how it did.
+pub fn wait(pid: Pid) -> Result<ExitStatus, WaitError> {
     let mut s = SCHED.lock();
     loop {
         let me = s.current().pid;
-        let t = s.tasks.get_mut(&pid)?;
+        let t = s.tasks.get_mut(&pid).ok_or(WaitError::NotChild)?;
         if t.parent != Some(me) {
-            return None;
+            return Err(WaitError::NotChild);
         }
         if t.state == State::Zombie {
-            let code = t.exit_code;
+            let status = t.exit;
             collect(&mut s, pid);
-            return Some(code);
+            return Ok(status);
+        }
+        if s.current().pending_signal.is_some() {
+            return Err(WaitError::Interrupted);
         }
         CHILD_EXITED.block_locked(&mut s);
     }
 }
 
-/// Collect any one exited child without blocking: Some((pid, exit code)).
-pub fn try_wait_any() -> Option<(Pid, i64)> {
+/// Collect any one ended child without blocking: Some((pid, status)).
+pub fn try_wait_any() -> Option<(Pid, ExitStatus)> {
     let mut s = SCHED.lock();
     let me = s.current().pid;
-    let (pid, code) = s
+    let (pid, status) = s
         .tasks
         .values()
         .find(|t| t.parent == Some(me) && t.state == State::Zombie)
-        .map(|t| (t.pid, t.exit_code))?;
+        .map(|t| (t.pid, t.exit))?;
     collect(&mut s, pid);
-    Some((pid, code))
+    Some((pid, status))
 }
+
+// ---------------------------------------------------------------- signals
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KillError {
+    /// No such process (or group), or only zombies.
+    NotFound,
+    /// Pid 1 can't be signalled: the system would stop.
+    Init,
+}
+
+#[derive(Clone, Copy)]
+pub enum KillTarget {
+    Process(Pid),
+    Group(Pid),
+}
+
+/// Send `signal` to a process or a process group. The target dies the next
+/// time it would return to user mode; a sleeping or blocked target is woken
+/// so that happens soon.
+pub fn kill(target: KillTarget, sig: u8) -> Result<(), KillError> {
+    let mut s = SCHED.lock();
+    let matches = |t: &Task| match target {
+        KillTarget::Process(pid) => t.pid == pid,
+        KillTarget::Group(pgid) => t.process.as_ref().map_or(false, |p| p.pgid.load(Ordering::Relaxed) == pgid),
+    };
+    let victims: Vec<Pid> = s.tasks.values().filter(|t| t.state != State::Zombie && matches(t)).map(|t| t.pid).collect();
+    if let KillTarget::Process(1) = target {
+        return Err(KillError::Init);
+    }
+    let mut sent = false;
+    for pid in victims.into_iter().filter(|&p| p != 1) {
+        let t = s.tasks.get_mut(&pid).unwrap();
+        t.pending_signal.get_or_insert(sig);
+        sent = true;
+        if matches!(t.state, State::Blocked | State::Sleeping) {
+            s.make_ready(pid);
+        }
+    }
+    if sent { Ok(()) } else { Err(KillError::NotFound) }
+}
+
+/// Put process `pid` in group `pgid`. Only the caller and its children can
+/// be moved.
+pub fn set_process_group(pid: Pid, pgid: Pid) -> Result<(), KillError> {
+    let mut s = SCHED.lock();
+    let me = s.current().pid;
+    let t = s.tasks.get(&pid).filter(|t| t.state != State::Zombie).ok_or(KillError::NotFound)?;
+    if pid != me && t.parent != Some(me) {
+        return Err(KillError::NotFound);
+    }
+    t.process.as_ref().ok_or(KillError::NotFound)?.pgid.store(pgid, Ordering::Relaxed);
+    Ok(())
+}
+
+/// On the way back to user mode: if a signal is pending, die of it.
+pub fn deliver_signals() {
+    let pending = SCHED.lock().current().pending_signal;
+    if let Some(sig) = pending {
+        exit_current(ExitStatus::Killed(sig));
+    }
+}
+
 
 /// The parent has the exit code of zombie `pid`: forget the task, or let the
 /// reaper do so if it still owns resources.
@@ -545,9 +660,13 @@ pub fn yield_now() {
     schedule(&mut SCHED.lock());
 }
 
+/// Sleep for `ms` milliseconds, or until a signal arrives.
 pub fn sleep_ms(ms: u64) {
     let mut s = SCHED.lock();
     let t = s.current();
+    if t.pending_signal.is_some() {
+        return;
+    }
     t.wake_at = uptime_ms().saturating_add(ms.max(1));
     t.state = State::Sleeping;
     let pid = t.pid;
@@ -603,6 +722,10 @@ pub fn idle() -> ! {
 
 // -------------------------------------------------------------- wait queues
 
+/// A signal interrupted a wait.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Interrupted;
+
 /// Tasks sleeping until some event happens, used like a condition variable:
 /// check the condition with its lock held, then `wait` with that lock's
 /// guard. A `wake_all` from another CPU can't slip in between the check and
@@ -619,8 +742,28 @@ impl WaitQueue {
         Self { waiters: SpinLock::new(Vec::new()) }
     }
 
+    /// Like `wait`, but gives up if a signal arrives (or is already pending),
+    /// returning with the lock released.
+    pub fn wait_interruptible<'a, T>(&self, guard: SpinLockGuard<'a, T>) -> Result<SpinLockGuard<'a, T>, Interrupted> {
+        let mut s = SCHED.lock();
+        if s.current().pending_signal.is_some() {
+            drop(s);
+            return Err(Interrupted);
+        }
+        self.enqueue_current(&mut s);
+        let (lock, irq) = guard.release();
+        schedule(&mut s);
+        let interrupted = s.current().pending_signal.is_some();
+        drop(s);
+        if interrupted {
+            return Err(Interrupted); // `irq` restores the interrupt state
+        }
+        Ok(lock.lock_with(irq))
+    }
+
     /// Release `guard`, sleep until woken, then take the lock again. Wakeups
-    /// can be spurious: re-check the condition in a loop.
+    /// can be spurious: re-check the condition in a loop. Signals don't cut
+    /// this short; use `wait_interruptible` where they should.
     pub fn wait<'a, T>(&self, guard: SpinLockGuard<'a, T>) -> SpinLockGuard<'a, T> {
         let mut s = SCHED.lock();
         // Queue up *before* releasing the caller's lock: whoever changes the

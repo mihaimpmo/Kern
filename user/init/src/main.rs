@@ -1,9 +1,14 @@
 //! init: the first user program, and the shell.
 //!
-//! A line is words separated by spaces, optionally with redirections
-//! (`< file`, `> file`, `>> file`) and a trailing `&` to run in the
-//! background. A word that isn't a builtin is a program: a path, or a name
-//! in /bin.
+//! A line is a pipeline: commands separated by `|`, each a list of words.
+//! The first command may read from a file (`< file`), the last may write to
+//! one (`> file`, `>> file` to append), and a trailing `&` runs the whole
+//! pipeline in the background. A word that isn't a builtin is a program: a
+//! path, or a name in /bin.
+//!
+//! Each pipeline runs as its own process group. While it runs in the
+//! foreground the console sends Ctrl+C to that group (SIGINT); at the
+//! prompt, Ctrl+C just abandons the line.
 
 #![no_std]
 #![no_main]
@@ -11,28 +16,28 @@
 extern crate alloc;
 
 use alloc::{format, string::String, vec::Vec};
-use ulib::fs::{self, flags};
-use ulib::{print, println, Errno};
+use ulib::fs::{self, flags, Fd};
+use ulib::{print, println, Errno, ExitStatus, Pid};
 
 const HELP: &str = "\
 builtins:
   help                this text
   cd [dir]            change directory (default /)
   pwd                 print the working directory
-  echo <text>         print text
-  ps                  list tasks
   mem                 memory usage
   uptime              time since boot
-  sleep <ms>          sleep for a while
   history             recent commands (Up/Down recall them)
   clear               clear the screen
 programs (in /bin; try `ls /bin`):
-  <program> [args]    run it and wait for it
-  <program> [args] &  run it in the background
-redirection:
+  echo, cat, ls, mkdir, rm, wc, ps, kill, sleep, date, hello, spin, crash, selftest
+running:
+  cmd args            run and wait; Ctrl+C interrupts it
+  cmd args &          run in the background
+  a | b | c           pipe each command's output into the next
   cmd < in > out      read from / write to files; >> appends";
 
 const HISTORY_SIZE: usize = 100;
+const CTRL_C: u8 = 3;
 
 #[no_mangle]
 fn main() -> i32 {
@@ -48,12 +53,12 @@ fn main() -> i32 {
             history.push(String::from(line));
         }
         match parse(line) {
-            Ok(Some(command)) => run(&command, &history),
+            Ok(Some(pipeline)) => run(&pipeline, &history),
             Ok(None) => {}
             Err(why) => println!("syntax error: {}", why),
         }
-        while let Some((pid, code)) = ulib::try_wait() {
-            println!("[{}] done (exit code {})", pid, code);
+        while let Some((pid, status)) = ulib::try_wait() {
+            println!("[{}] done ({})", pid, status);
         }
     }
 }
@@ -116,6 +121,12 @@ fn read_line(prompt: &str, history: &[String]) -> String {
                     println!();
                     return line;
                 }
+                CTRL_C => {
+                    // Nothing runs in the foreground at the prompt, so the
+                    // key arrives here: abandon the line.
+                    println!("^C");
+                    return String::new();
+                }
                 0x08 | 0x7f => {
                     if line.pop().is_some() {
                         print!("\x08 \x08");
@@ -134,8 +145,9 @@ fn read_line(prompt: &str, history: &[String]) -> String {
 
 // --------------------------------------------------------------- parsing
 
-struct Command<'a> {
-    words: Vec<&'a str>,
+struct Pipeline<'a> {
+    /// The words of each command, in order.
+    commands: Vec<Vec<&'a str>>,
     stdin: Option<&'a str>,
     /// File, and whether to append.
     stdout: Option<(&'a str, bool)>,
@@ -143,75 +155,84 @@ struct Command<'a> {
 }
 
 /// None for an empty line.
-fn parse(line: &str) -> Result<Option<Command<'_>>, &'static str> {
-    let mut command = Command { words: Vec::new(), stdin: None, stdout: None, background: false };
-    let mut tokens = line.split_ascii_whitespace().peekable();
-    while let Some(token) = tokens.next() {
-        // `> file` and `>file` both work.
-        let (op, rest) = if let Some(rest) = token.strip_prefix(">>") {
-            (">>", rest)
-        } else if let Some(rest) = token.strip_prefix('>') {
-            (">", rest)
-        } else if let Some(rest) = token.strip_prefix('<') {
-            ("<", rest)
-        } else if token == "&" {
-            if tokens.peek().is_some() {
-                return Err("& must come last");
-            }
-            command.background = true;
-            continue;
-        } else {
-            command.words.push(token);
-            continue;
-        };
-        let file = if rest.is_empty() { tokens.next().ok_or("missing file name after redirection")? } else { rest };
-        match op {
-            "<" => command.stdin = Some(file),
-            _ => command.stdout = Some((file, op == ">>")),
+fn parse(line: &str) -> Result<Option<Pipeline<'_>>, &'static str> {
+    let mut p = Pipeline { commands: Vec::new(), stdin: None, stdout: None, background: false };
+    for (i, part) in line.split('|').enumerate() {
+        if i > 0 && p.stdout.is_some() {
+            return Err("only the last command can write to a file");
         }
+        if p.background {
+            return Err("& must come last");
+        }
+        let mut words = Vec::new();
+        let mut tokens = part.split_ascii_whitespace().peekable();
+        while let Some(token) = tokens.next() {
+            // `> file` and `>file` both work.
+            let (op, rest) = if let Some(rest) = token.strip_prefix(">>") {
+                (">>", rest)
+            } else if let Some(rest) = token.strip_prefix('>') {
+                (">", rest)
+            } else if let Some(rest) = token.strip_prefix('<') {
+                ("<", rest)
+            } else if token == "&" {
+                if tokens.peek().is_some() {
+                    return Err("& must come last");
+                }
+                p.background = true;
+                continue;
+            } else {
+                words.push(token);
+                continue;
+            };
+            let file = if rest.is_empty() { tokens.next().ok_or("missing file name after redirection")? } else { rest };
+            if op == "<" {
+                if i > 0 {
+                    return Err("only the first command can read from a file");
+                }
+                p.stdin = Some(file);
+            } else {
+                p.stdout = Some((file, op == ">>"));
+            }
+        }
+        if words.len() > ulib::MAX_ARGS {
+            return Err("too many words");
+        }
+        p.commands.push(words);
     }
-    if command.words.is_empty() {
-        return if command.stdin.is_some() || command.stdout.is_some() { Err("nothing to run") } else { Ok(None) };
+    if p.commands.iter().all(|c| c.is_empty()) && p.stdin.is_none() && p.stdout.is_none() && !p.background {
+        return Ok(None);
     }
-    if command.words.len() > ulib::MAX_ARGS {
-        return Err("too many words");
+    if p.commands.iter().any(|c| c.is_empty()) {
+        return Err("empty command");
     }
-    Ok(Some(command))
+    Ok(Some(p))
 }
 
 // --------------------------------------------------------------- running
 
-/// Points stdin/stdout at files while it lives; restores them when dropped.
+/// Points fds 0/1 elsewhere while it lives; puts them back when dropped.
 /// Builtins print through fd 1 like programs do, and a spawned child gets
 /// its own copy of the descriptors, so this works for both.
-struct Redirect {
-    saved: Vec<(fs::Fd, fs::Fd)>, // (target fd, saved original)
+struct FdSwap {
+    saved: Vec<(Fd, Fd)>, // (target fd, saved original)
 }
 
-impl Redirect {
-    fn apply(command: &Command) -> Result<Redirect, String> {
-        let mut redirect = Redirect { saved: Vec::new() };
-        if let Some(path) = command.stdin {
-            redirect.point(ulib::STDIN, path, flags::READ_ONLY)?;
-        }
-        if let Some((path, append)) = command.stdout {
-            let mode = flags::WRITE_ONLY | flags::CREATE | if append { flags::APPEND } else { flags::TRUNCATE };
-            redirect.point(ulib::STDOUT, path, mode)?;
-        }
-        Ok(redirect)
+impl FdSwap {
+    fn new() -> FdSwap {
+        FdSwap { saved: Vec::new() }
     }
 
-    fn point(&mut self, target: fs::Fd, path: &str, mode: u64) -> Result<(), String> {
-        let file = fs::open(path, mode).map_err(|e| format!("{}: {}", path, e))?;
-        let saved = fs::dup(target).map_err(|e| format!("{}: {}", path, e))?;
-        let _ = fs::dup2(file, target);
-        let _ = fs::close(file);
+    /// Make `target` refer to `fd`'s open file.
+    fn point(&mut self, target: Fd, fd: Fd) -> Result<(), Errno> {
+        // Close-on-spawn: the saved copy must not leak into children.
+        let saved = fs::dup(target, flags::CLOSE_ON_SPAWN)?;
+        let _ = fs::dup2(fd, target);
         self.saved.push((target, saved));
         Ok(())
     }
 }
 
-impl Drop for Redirect {
+impl Drop for FdSwap {
     fn drop(&mut self) {
         for &(target, saved) in self.saved.iter().rev() {
             let _ = fs::dup2(saved, target);
@@ -220,16 +241,63 @@ impl Drop for Redirect {
     }
 }
 
-fn run(command: &Command, history: &[String]) {
-    let redirect = match Redirect::apply(command) {
-        Ok(r) => r,
+/// Open the pipeline's redirection files: (stdin, stdout). Close-on-spawn,
+/// so only the command they're meant for gets them (as fd 0 or 1).
+fn open_redirections(p: &Pipeline) -> Result<(Option<Fd>, Option<Fd>), String> {
+    let stdin = match p.stdin {
+        Some(path) => Some(fs::open(path, flags::READ_ONLY | flags::CLOSE_ON_SPAWN).map_err(|e| format!("{}: {}", path, e))?),
+        None => None,
+    };
+    let stdout = match p.stdout {
+        Some((path, append)) => {
+            let mode = flags::WRITE_ONLY | flags::CREATE | flags::CLOSE_ON_SPAWN | if append { flags::APPEND } else { flags::TRUNCATE };
+            match fs::open(path, mode) {
+                Ok(fd) => Some(fd),
+                Err(e) => {
+                    if let Some(fd) = stdin {
+                        let _ = fs::close(fd);
+                    }
+                    return Err(format!("{}: {}", path, e));
+                }
+            }
+        }
+        None => None,
+    };
+    Ok((stdin, stdout))
+}
+
+fn run(p: &Pipeline, history: &[String]) {
+    let (stdin, stdout) = match open_redirections(p) {
+        Ok(fds) => fds,
         Err(why) => {
             println!("{}", why);
             return;
         }
     };
-    let (cmd, args) = (command.words[0], &command.words[1..]);
-    match cmd {
+    if p.commands.len() == 1 && is_builtin(p.commands[0][0]) {
+        let mut swap = FdSwap::new();
+        let ok = stdin.map_or(Ok(()), |fd| swap.point(ulib::STDIN, fd)).and(stdout.map_or(Ok(()), |fd| swap.point(ulib::STDOUT, fd)));
+        if ok.is_ok() {
+            builtin(&p.commands[0], history);
+        }
+        drop(swap);
+    } else if let Some(name) = p.commands.iter().map(|c| c[0]).find(|&w| is_builtin(w)) {
+        println!("{}: a builtin can't be part of a pipeline", name);
+    } else {
+        run_programs(p, stdin, stdout);
+    }
+    for fd in [stdin, stdout].into_iter().flatten() {
+        let _ = fs::close(fd);
+    }
+}
+
+fn is_builtin(word: &str) -> bool {
+    matches!(word, "help" | "cd" | "pwd" | "mem" | "uptime" | "history" | "clear" | "init")
+}
+
+fn builtin(words: &[&str], history: &[String]) {
+    let args = &words[1..];
+    match words[0] {
         "help" => println!("{}", HELP),
         "cd" => {
             let dir = args.first().copied().unwrap_or("/");
@@ -241,7 +309,6 @@ fn run(command: &Command, history: &[String]) {
             let mut buf = [0u8; 4096];
             println!("{}", fs::getcwd(&mut buf).unwrap_or("?"));
         }
-        "echo" => println!("{}", args.join(" ")),
         "clear" => print!("\x1b[2J\x1b[H"),
         "uptime" => {
             let ms = ulib::uptime_ms();
@@ -258,34 +325,80 @@ fn run(command: &Command, history: &[String]) {
                 info.cpus
             );
         }
-        "sleep" => match args {
-            [ms] if ms.parse::<u64>().is_ok() => ulib::sleep_ms(ms.parse().unwrap()),
-            _ => println!("usage: sleep <ms>"),
-        },
-        "ps" => {
-            let mut buf = [0u8; 4096];
-            let n = ulib::ps(&mut buf).unwrap_or(0);
-            let _ = ulib::write_all(ulib::STDOUT, &buf[..n]);
-        }
         "history" => {
             for (i, line) in history.iter().enumerate() {
                 println!("{:>4}  {}", i + 1, line);
             }
         }
         "init" => println!("init is already running"),
-        program => {
-            let spawned = ulib::spawn(program, args);
-            drop(redirect); // the child has its own copy of the descriptors
-            match spawned {
-                Err(Errno::ENOENT) => println!("{}: command not found (try 'help' or 'ls /bin')", program),
-                Err(e) => println!("{}: could not start: {}", program, e),
-                Ok(pid) if command.background => println!("[{}] started in background", pid),
-                Ok(pid) => match ulib::wait(pid) {
-                    Ok(0) => {}
-                    Ok(code) => println!("[{}] exited with code {}", pid, code),
-                    Err(e) => println!("[{}] could not wait for it: {}", pid, e),
-                },
+        other => println!("{}: not a builtin", other),
+    }
+}
+
+/// Start every command of the pipeline, connected by pipes, in one new
+/// process group; then wait for them unless it runs in the background.
+fn run_programs(p: &Pipeline, stdin: Option<Fd>, stdout: Option<Fd>) {
+    let mut pids: Vec<Pid> = Vec::new();
+    let mut input = stdin; // what the next command reads from
+    let mut owned_input = false; // whether `input` is a pipe end we must close
+    let last = p.commands.len() - 1;
+    for (i, words) in p.commands.iter().enumerate() {
+        let (next_input, output) = if i < last {
+            match fs::pipe(flags::CLOSE_ON_SPAWN) {
+                Ok((r, w)) => (Some(r), Some(w)),
+                Err(e) => {
+                    println!("pipe: {}", e);
+                    break;
+                }
             }
+        } else {
+            (None, stdout)
+        };
+        let mut swap = FdSwap::new();
+        let mut ok = true;
+        if let Some(fd) = input {
+            ok &= swap.point(ulib::STDIN, fd).is_ok();
         }
+        if let Some(fd) = output {
+            ok &= swap.point(ulib::STDOUT, fd).is_ok();
+        }
+        let spawned = if ok { ulib::spawn(words[0], &words[1..]) } else { Err(Errno::EMFILE) };
+        drop(swap);
+        // The child has its own copies; ours would keep the pipes open.
+        if owned_input {
+            let _ = fs::close(input.unwrap());
+        }
+        if i < last {
+            let _ = fs::close(output.unwrap());
+        }
+        input = next_input;
+        owned_input = next_input.is_some();
+        match spawned {
+            Ok(pid) => {
+                let _ = ulib::setpgid(pid, pids.first().copied().unwrap_or(pid));
+                pids.push(pid);
+            }
+            Err(Errno::ENOENT) => println!("{}: command not found (try 'help' or 'ls /bin')", words[0]),
+            Err(e) => println!("{}: could not start: {}", words[0], e),
+        }
+    }
+    if owned_input {
+        let _ = fs::close(input.unwrap());
+    }
+    let Some(&group) = pids.first() else { return };
+    if p.background {
+        println!("[{}] started in background", group);
+        return;
+    }
+    ulib::set_foreground(group);
+    let mut last_status = None;
+    for &pid in &pids {
+        last_status = ulib::wait(pid).ok();
+    }
+    ulib::set_foreground(0);
+    match last_status {
+        Some(ExitStatus::Exited(0)) | None => {}
+        Some(ExitStatus::Killed(sig)) if sig == ulib::signal::SIGINT => println!("^C"),
+        Some(status) => println!("[{}] {}", pids[pids.len() - 1], status),
     }
 }

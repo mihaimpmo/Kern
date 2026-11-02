@@ -91,6 +91,10 @@ extern "C" fn kmain() -> ! {
 
     let ticks = apic::start_timer();
     ok(format_args!("timer: 1000 Hz (APIC bus ~{} MHz)", ticks * 16 / 1000));
+    match drivers::rtc::init(task::uptime_ms()) {
+        Some(seconds) => ok(format_args!("clock: {} s since 1970 (UTC)", seconds)),
+        None => kprintln!("\x1b[93m[warn]\x1b[0m real-time clock unreadable; time() will return 0"),
+    }
 
     syscall::init();
     task::add_cpu();
@@ -118,7 +122,8 @@ extern "C" fn kmain() -> ! {
     ok(format_args!("filesystem: {} file(s) from the initramfs", unpacked));
 
     let init = cmdline::get("init").unwrap_or("init");
-    let inherit = task::Inherit { files: fs::FdTable::with_console(), cwd: alloc::string::String::from("/") };
+    // Pid 1 starts in process group 1.
+    let inherit = task::Inherit { files: fs::FdTable::with_console(), cwd: alloc::string::String::from("/"), pgid: 1 };
     match task::spawn_program(init, &[init.as_bytes()], None, inherit) {
         Ok(pid) => ok(format_args!("started {} (pid {})", init, pid)),
         Err(e) => kprintln!("\x1b[91m[fail]\x1b[0m could not start {}: {}", init, e),

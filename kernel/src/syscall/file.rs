@@ -74,7 +74,7 @@ pub fn write(fd: u64, buf: u64, len: u64) -> SysResult {
 pub fn open(path: u64, len: u64, flags: u64) -> SysResult {
     let path = user_path(path, len)?;
     let file = fs::open(&cwd()?, &path, flags)?;
-    Ok(process()?.files.lock().insert(file)?)
+    Ok(process()?.files.lock().insert(file, flags & fs::flags::CLOSE_ON_SPAWN != 0)?)
 }
 
 pub fn close(fd: u64) -> SysResult {
@@ -87,15 +87,20 @@ pub fn lseek(fd: u64, offset: i64, whence: u64) -> SysResult {
     Ok(file(fd)?.seek(offset, whence)?)
 }
 
-/// `struct Stat { kind: u64 (1 file, 2 directory, 3 device), size: u64 }`
-fn put_stat(inode: &Arc<dyn fs::Inode>, ptr: u64) -> SysResult {
-    let kind: u64 = match inode.kind() {
+/// How a kind is numbered in Stat and readdir entries.
+fn kind_code(kind: Kind) -> u8 {
+    match kind {
         Kind::File => 1,
         Kind::Dir => 2,
         Kind::Device => 3,
-    };
+        Kind::Pipe => 4,
+    }
+}
+
+/// `struct Stat { kind: u64 (1 file, 2 directory, 3 device, 4 pipe), size: u64 }`
+fn put_stat(inode: &Arc<dyn fs::Inode>, ptr: u64) -> SysResult {
     let mut out = [0u8; 16];
-    out[..8].copy_from_slice(&kind.to_le_bytes());
+    out[..8].copy_from_slice(&(kind_code(inode.kind()) as u64).to_le_bytes());
     out[8..].copy_from_slice(&inode.size().to_le_bytes());
     copy_to_user(ptr, &out)?;
     Ok(0)
@@ -126,11 +131,7 @@ pub fn readdir(fd: u64, buf: u64, len: u64) -> SysResult {
         None => Ok(0),
         Some((name, kind)) => {
             let mut out = alloc::vec::Vec::with_capacity(1 + name.len());
-            out.push(match kind {
-                Kind::File => 1,
-                Kind::Dir => 2,
-                Kind::Device => 3,
-            });
+            out.push(kind_code(kind));
             out.extend_from_slice(name.as_bytes());
             copy_out(&out, buf, len)
         }
@@ -168,11 +169,15 @@ pub fn getcwd(buf: u64, len: u64) -> SysResult {
     copy_out(cwd.as_bytes(), buf, len)
 }
 
-pub fn dup(fd: u64) -> SysResult {
+/// `flags` is 0 or CLOSE_ON_SPAWN (like F_DUPFD_CLOEXEC).
+pub fn dup(fd: u64, flags: u64) -> SysResult {
+    if flags & !fs::flags::CLOSE_ON_SPAWN != 0 {
+        return Err(EINVAL);
+    }
     let process = process()?;
     let mut files = process.files.lock();
     let file = files.get(fd)?;
-    Ok(files.insert(file)?)
+    Ok(files.insert(file, flags != 0)?)
 }
 
 pub fn dup2(fd: u64, new_fd: u64) -> SysResult {
@@ -187,4 +192,32 @@ pub fn dup2(fd: u64, new_fd: u64) -> SysResult {
     };
     drop(replaced); // closed outside the table's lock
     Ok(new_fd)
+}
+
+/// A new pipe: `fds[0]` reads, `fds[1]` writes. `flags` may be
+/// CLOSE_ON_SPAWN (O_CLOEXEC) for both ends.
+pub fn pipe(fds: u64, flags: u64) -> SysResult {
+    if flags & !fs::flags::CLOSE_ON_SPAWN != 0 {
+        return Err(EINVAL);
+    }
+    let cloexec = flags != 0;
+    check_user(fds, 16, true)?;
+    let (read_end, write_end) = fs::pipe::new();
+    let process = process()?;
+    let (r, w) = {
+        let mut files = process.files.lock();
+        let r = files.insert(OpenFile::new(read_end, true, false, false), cloexec)?;
+        match files.insert(OpenFile::new(write_end, false, true, false), cloexec) {
+            Ok(w) => (r, w),
+            Err(e) => {
+                let _ = files.close(r);
+                return Err(e.into());
+            }
+        }
+    };
+    let mut out = [0u8; 16];
+    out[..8].copy_from_slice(&r.to_le_bytes());
+    out[8..].copy_from_slice(&w.to_le_bytes());
+    copy_to_user(fds, &out)?;
+    Ok(0)
 }

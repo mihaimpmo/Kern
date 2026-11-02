@@ -13,11 +13,11 @@ extern crate alloc;
 use alloc::{boxed::Box, string::String, vec, vec::Vec};
 use core::hint::black_box;
 use ulib::fs::{self, flags, Kind, Whence};
-use ulib::{println, prot, sys, syscall6, Errno};
+use ulib::{println, prot, signal, sys, syscall6, Errno, ExitStatus};
 
 const NAME: &str = "selftest";
-/// Exit code of a process killed by a page fault: -(128 + vector 14).
-const PAGE_FAULT_EXIT: i64 = -142;
+/// How a process that touched memory it may not ends.
+const KILLED_SEGV: ExitStatus = ExitStatus::Killed(signal::SIGSEGV);
 /// Mapped nowhere in user space, and not canonical-adjacent.
 const BAD_PTR: u64 = 0xdead_0000_0000;
 
@@ -99,6 +99,37 @@ fn main() -> i32 {
         }
         // Exit code: how many bytes standard input had.
         ["stdin-len"] => fs::read_to_end(ulib::STDIN).map_or(-1, |d| d.len() as i32),
+        ["write-bytes", n] => {
+            let chunk = [b'x'; 4096];
+            let mut left = n.parse::<usize>().unwrap_or(0);
+            while left > 0 {
+                let k = left.min(chunk.len());
+                if ulib::write_all(ulib::STDOUT, &chunk[..k]).is_err() {
+                    return 1;
+                }
+                left -= k;
+            }
+            0
+        }
+        // Exit code 1 if descriptor `fd` is open, 0 if not.
+        ["fd-open", fd] => fs::fstat(fd.parse().unwrap_or(999)).is_ok() as i32,
+        ["spin-forever"] => loop {
+            core::hint::spin_loop();
+        },
+        ["sleep-forever"] => {
+            ulib::sleep_ms(3_600_000);
+            0
+        }
+        ["read-forever"] => fs::read_to_end(ulib::STDIN).map_or(1, |_| 0),
+        ["illegal"] => unsafe {
+            core::arch::asm!("ud2");
+            0
+        },
+        ["divide"] => unsafe {
+            // Hardware divide by zero (Rust's own `/` would panic first).
+            core::arch::asm!("xor edx, edx", "xor ecx, ecx", "div ecx", out("eax") _, out("edx") _, out("ecx") _);
+            0
+        },
         ["orphan"] => {
             // Our child finishes (and is cleaned up) while we are alive; then
             // we exit without waiting for it.
@@ -144,7 +175,11 @@ fn raw(n: u64, a0: u64, a1: u64, a2: u64) -> i64 {
 }
 
 /// Run `selftest <args>` and wait for its exit code.
-fn run_child(args: &[&str]) -> Result<i64, Errno> {
+fn exited(code: i32) -> Result<ExitStatus, Errno> {
+    Ok(ExitStatus::Exited(code))
+}
+
+fn run_child(args: &[&str]) -> Result<ExitStatus, Errno> {
     ulib::wait(ulib::spawn(NAME, args)?)
 }
 
@@ -157,6 +192,8 @@ fn run_all() -> i32 {
     multicore(&mut t);
     memory(&mut t);
     files(&mut t);
+    pipes(&mut t);
+    signals(&mut t);
     leaks(&mut t);
     println!("selftest: {} checks, {} failed", t.run, t.failed);
     t.failed as i32
@@ -202,18 +239,18 @@ fn processes(t: &mut Suite) {
     check!(t, "spawn with too many arguments is E2BIG", r == -Errno::E2BIG.0, "got {}", r);
 
     let r = run_child(&["exit", "3"]);
-    check!(t, "child exit code", r == Ok(3), "got {:?}", r);
+    check!(t, "child exit code", r == exited(3), "got {:?}", r);
     let r = run_child(&["exit", "-5"]);
-    check!(t, "negative exit code is not an error", r == Ok(-5), "got {:?}", r);
+    check!(t, "negative exit code is not an error", r == exited(-5), "got {:?}", r);
     let r = run_child(&["argcheck", "one", "two words", ""]);
-    check!(t, "arguments reach the child intact", r == Ok(0), "got {:?}", r);
+    check!(t, "arguments reach the child intact", r == exited(0), "got {:?}", r);
     let r = run_child(&["fault"]);
-    check!(t, "faulting child is killed", r == Ok(PAGE_FAULT_EXIT), "got {:?}", r);
+    check!(t, "faulting child is killed", r == Ok(KILLED_SEGV), "got {:?}", r);
 
     let pid = ulib::spawn(NAME, &["exit", "9"]);
     ulib::sleep_ms(50);
     let r = ulib::try_wait();
-    check!(t, "try_wait collects a finished child", r.is_some() && r == pid.ok().map(|p| (p, 9)), "got {:?}", r);
+    check!(t, "try_wait collects a finished child", r.is_some() && r == pid.ok().map(|p| (p, ExitStatus::Exited(9))), "got {:?}", r);
 
     // Several children at once, collected in reverse order.
     let mut pids = [0; 16];
@@ -222,7 +259,7 @@ fn processes(t: &mut Suite) {
     }
     let mut all_ok = pids.iter().all(|&p| p != 0);
     for (i, &pid) in pids.iter().enumerate().rev() {
-        all_ok &= ulib::wait(pid) == Ok((i % 4) as i64);
+        all_ok &= ulib::wait(pid) == exited((i % 4) as i32);
     }
     check!(t, "16 concurrent children", all_ok);
 }
@@ -258,7 +295,7 @@ fn multicore(t: &mut Suite) {
         }
         for &pid in &pids {
             let r = ulib::wait(pid);
-            if pid == 0 || r != Ok(7) {
+            if pid == 0 || r != exited(7) {
                 println!("  round {}: pid {} -> {:?}", round, pid, r);
                 all_ok = false;
             }
@@ -274,7 +311,7 @@ fn multicore(t: &mut Suite) {
         *pid = r.unwrap_or(0);
     }
     let codes = pids.map(|pid| ulib::wait(pid));
-    check!(t, "SSE state is per process", codes.iter().all(|c| *c == Ok(0)), "exit codes {:?}", codes);
+    check!(t, "SSE state is per process", codes.iter().all(|c| *c == exited(0)), "exit codes {:?}", codes);
 
     if cpus < 2 {
         return;
@@ -433,12 +470,12 @@ fn memory(t: &mut Suite) {
     // Faults that must kill, and stack use that must not.
     for mode in ["use-after-munmap", "write-readonly", "exec-heap"] {
         let r = run_child(&[mode]);
-        check!(t, mode, r == Ok(PAGE_FAULT_EXIT), "got {:?}", r);
+        check!(t, mode, r == Ok(KILLED_SEGV), "got {:?}", r);
     }
     let r = run_child(&["stack", "6"]);
-    check!(t, "6 MiB of stack works", r == Ok(0), "got {:?}", r);
+    check!(t, "6 MiB of stack works", r == exited(0), "got {:?}", r);
     let r = run_child(&["stack", "9"]);
-    check!(t, "stack overflow is a fault", r == Ok(PAGE_FAULT_EXIT), "got {:?}", r);
+    check!(t, "stack overflow is a fault", r == Ok(KILLED_SEGV), "got {:?}", r);
 }
 
 fn write_file(path: &str, data: &[u8]) -> Result<(), Errno> {
@@ -449,9 +486,9 @@ fn write_file(path: &str, data: &[u8]) -> Result<(), Errno> {
 }
 
 /// Run `selftest <args>` with fd `target` pointed at `path`.
-fn run_redirected(target: fs::Fd, path: &str, mode: u64, args: &[&str]) -> Result<i64, Errno> {
+fn run_redirected(target: fs::Fd, path: &str, mode: u64, args: &[&str]) -> Result<ExitStatus, Errno> {
     let file = fs::open(path, mode)?;
-    let saved = fs::dup(target)?;
+    let saved = fs::dup(target, flags::CLOSE_ON_SPAWN)?;
     fs::dup2(file, target)?;
     let _ = fs::close(file);
     let pid = ulib::spawn(NAME, args);
@@ -467,7 +504,7 @@ fn files(t: &mut Suite) {
     let head = fs::read_file("/bin/selftest").map(|d| d.get(..4) == Some(b"\x7fELF"));
     check!(t, "reading a program file", head == Ok(true), "{:?}", head);
     let r = ulib::spawn("/bin/selftest", &["exit", "4"]).and_then(ulib::wait);
-    check!(t, "spawn by absolute path", r == Ok(4), "{:?}", r);
+    check!(t, "spawn by absolute path", r == exited(4), "{:?}", r);
 
     // Create, write, read back.
     let _ = fs::mkdir("/tmp/st");
@@ -486,7 +523,7 @@ fn files(t: &mut Suite) {
         check!(t, "seek then read", r == Ok(5) && &buf == b"world", "{:?}", r);
         let end = fs::seek(fd, 0, Whence::End);
         check!(t, "seek to the end", end == Ok(11), "{:?}", end);
-        let dup = fs::dup(fd);
+        let dup = fs::dup(fd, 0);
         let _ = fs::seek(fd, 0, Whence::Start);
         let mut a = [0u8; 3];
         let mut b = [0u8; 3];
@@ -531,7 +568,7 @@ fn files(t: &mut Suite) {
     check!(t, "relative path", fs::stat("a.txt").map(|s| s.size) == Ok(3));
     check!(t, "path with . and ..", fs::stat("../st/./d/../a.txt").map(|s| s.size) == Ok(3));
     let r = ulib::spawn("../../bin/selftest", &["exit", "6"]).and_then(ulib::wait);
-    check!(t, "spawn by relative path", r == Ok(6), "{:?}", r);
+    check!(t, "spawn by relative path", r == exited(6), "{:?}", r);
     check!(t, "chdir to a file is ENOTDIR", fs::chdir("a.txt") == Err(Errno::ENOTDIR));
     let _ = fs::chdir("/");
     let _ = fs::chdir("..");
@@ -571,9 +608,9 @@ fn files(t: &mut Suite) {
     let out = flags::WRITE_ONLY | flags::CREATE | flags::TRUNCATE;
     let r = run_redirected(ulib::STDOUT, "/tmp/st/out", out, &["say", "redirected"]);
     let d = fs::read_file("/tmp/st/out");
-    check!(t, "child output into a file", r == Ok(0) && d.as_deref() == Ok(&b"redirected\n"[..]), "{:?} {:?}", r, d);
+    check!(t, "child output into a file", r == exited(0) && d.as_deref() == Ok(&b"redirected\n"[..]), "{:?} {:?}", r, d);
     let r = run_redirected(ulib::STDIN, "/tmp/st/a.txt", flags::READ_ONLY, &["stdin-len"]);
-    check!(t, "child input from a file", r == Ok(3), "{:?}", r);
+    check!(t, "child input from a file", r == exited(3), "{:?}", r);
 
     // An unlinked file lives on while open.
     let fd = fs::open("/tmp/st/a.txt", flags::READ_ONLY);
@@ -597,6 +634,160 @@ fn files(t: &mut Suite) {
     check!(t, "cleanup", fs::stat("/tmp/st") == Err(Errno::ENOENT));
 }
 
+/// Spawn `selftest <args>` with its stdin/stdout pointed at the given fds.
+fn spawn_with(stdin: Option<fs::Fd>, stdout: Option<fs::Fd>, args: &[&str]) -> Result<ulib::Pid, Errno> {
+    let mut saved = Vec::new();
+    for (target, fd) in [(ulib::STDIN, stdin), (ulib::STDOUT, stdout)] {
+        if let Some(fd) = fd {
+            saved.push((target, fs::dup(target, flags::CLOSE_ON_SPAWN)?));
+            fs::dup2(fd, target)?;
+        }
+    }
+    let pid = ulib::spawn(NAME, args);
+    for (target, copy) in saved.into_iter().rev() {
+        let _ = fs::dup2(copy, target);
+        let _ = fs::close(copy);
+    }
+    pid
+}
+
+fn pipes(t: &mut Suite) {
+    // In one process.
+    match fs::pipe(0) {
+        Ok((r, w)) => {
+            let mut buf = [0u8; 16];
+            let wrote = ulib::write(w, b"hello");
+            let read = ulib::read(r, &mut buf);
+            check!(t, "pipe passes data", wrote == Ok(5) && read == Ok(5) && &buf[..5] == b"hello", "{:?} {:?}", wrote, read);
+            check!(t, "fstat of a pipe", fs::fstat(r).map(|s| s.kind) == Ok(Kind::Pipe));
+            let _ = fs::close(w);
+            check!(t, "closed write end reads as EOF", ulib::read(r, &mut buf) == Ok(0));
+            let _ = fs::close(r);
+        }
+        Err(e) => check!(t, "pipe passes data", false, "{:?}", e),
+    }
+    if let Ok((r, w)) = fs::pipe(0) {
+        let _ = fs::close(r);
+        let res = ulib::write(w, b"x");
+        check!(t, "writing with no reader is EPIPE", res == Err(Errno::EPIPE), "{:?}", res);
+        let _ = fs::close(w);
+    }
+    check!(t, "pipe with bad flags is EINVAL", fs::pipe(1) == Err(Errno::EINVAL));
+
+    // 1 MiB through a 64 KiB pipe: both sides block and wake many times.
+    const BIG: usize = 1 << 20;
+    if let Ok((r, w)) = fs::pipe(flags::CLOSE_ON_SPAWN) {
+        let child = spawn_with(None, Some(w), &["write-bytes", "1048576"]);
+        let _ = fs::close(w);
+        let got = fs::read_to_end(r).map(|d| (d.len(), d.iter().all(|&b| b == b'x')));
+        let _ = fs::close(r);
+        let status = child.and_then(ulib::wait);
+        check!(t, "1 MiB from a child through a pipe", got == Ok((BIG, true)) && status == exited(0), "{:?} {:?}", got, status);
+    }
+    if let Ok((r, w)) = fs::pipe(flags::CLOSE_ON_SPAWN) {
+        let child = spawn_with(Some(r), None, &["stdin-len"]);
+        let _ = fs::close(r);
+        let chunk = [b'y'; 4096];
+        let mut ok = true;
+        for _ in 0..(BIG / chunk.len()) {
+            ok &= ulib::write_all(w, &chunk).is_ok();
+        }
+        let _ = fs::close(w);
+        let status = child.and_then(ulib::wait);
+        check!(t, "1 MiB to a child through a pipe", ok && status == exited(BIG as i32), "{:?}", status);
+    }
+
+    // Close-on-spawn descriptors aren't inherited, whether from open or dup.
+    if let Ok(fd) = fs::open("/bin/selftest", flags::READ_ONLY) {
+        let copy = fs::dup(fd, flags::CLOSE_ON_SPAWN);
+        let text = copy.map(|c| alloc::format!("{}", c)).unwrap_or_default();
+        let r = run_child(&["fd-open", &text]);
+        check!(t, "close-on-spawn dup is not inherited", copy.is_ok() && r == exited(0), "{:?} {:?}", copy, r);
+        check!(t, "dup with bad flags is EINVAL", fs::dup(fd, 1) == Err(Errno::EINVAL));
+        for c in [Ok(fd), copy].into_iter().flatten() {
+            let _ = fs::close(c);
+        }
+    }
+    for (cloexec, expect) in [(flags::CLOSE_ON_SPAWN, 0), (0, 1)] {
+        let fd = fs::open("/bin/selftest", flags::READ_ONLY | cloexec);
+        let text = fd.map(|fd| alloc::format!("{}", fd)).unwrap_or_default();
+        let r = run_child(&["fd-open", &text]);
+        let name = if cloexec != 0 { "close-on-spawn fd is not inherited" } else { "plain fd is inherited" };
+        check!(t, name, r == exited(expect), "{:?}", r);
+        if let Ok(fd) = fd {
+            let _ = fs::close(fd);
+        }
+    }
+}
+
+fn signals(t: &mut Suite) {
+    use ulib::signal::{SIGINT, SIGKILL, SIGTERM};
+    let killed = |sig| Ok(ExitStatus::Killed(sig));
+
+    // A process that never makes a system call still dies (at a timer tick).
+    if let Ok(pid) = ulib::spawn(NAME, &["spin-forever"]) {
+        ulib::sleep_ms(20);
+        let start = ulib::uptime_ms();
+        let sent = ulib::kill(pid as i64, SIGKILL);
+        let r = ulib::wait(pid);
+        let took = ulib::uptime_ms() - start;
+        check!(t, "SIGKILL stops a spinning process", sent.is_ok() && r == killed(SIGKILL) && took < 200, "{:?} {:?} {} ms", sent, r, took);
+    }
+    // A sleeping one is woken to die.
+    if let Ok(pid) = ulib::spawn(NAME, &["sleep-forever"]) {
+        ulib::sleep_ms(20);
+        let start = ulib::uptime_ms();
+        let _ = ulib::kill(pid as i64, SIGTERM);
+        let r = ulib::wait(pid);
+        let took = ulib::uptime_ms() - start;
+        check!(t, "SIGTERM interrupts sleep", r == killed(SIGTERM) && took < 200, "{:?} {} ms", r, took);
+    }
+    // So is one blocked reading a pipe nobody writes to.
+    if let Ok((r_end, w_end)) = fs::pipe(flags::CLOSE_ON_SPAWN) {
+        let child = spawn_with(Some(r_end), None, &["read-forever"]);
+        ulib::sleep_ms(20);
+        if let Ok(pid) = child {
+            let _ = ulib::kill(pid as i64, SIGINT);
+        }
+        let r = child.and_then(ulib::wait);
+        check!(t, "SIGINT interrupts a blocking read", r == killed(SIGINT), "{:?}", r);
+        let _ = fs::close(r_end);
+        let _ = fs::close(w_end);
+    }
+    // A whole process group at once.
+    let mut pids = Vec::new();
+    for _ in 0..3 {
+        if let Ok(pid) = ulib::spawn(NAME, &["sleep-forever"]) {
+            let group = pids.first().copied().unwrap_or(pid);
+            let _ = ulib::setpgid(pid, group);
+            pids.push(pid);
+        }
+    }
+    let sent = ulib::kill(-(pids[0] as i64), SIGTERM);
+    let all = pids.iter().all(|&pid| ulib::wait(pid) == killed(SIGTERM));
+    check!(t, "kill a process group", sent.is_ok() && pids.len() == 3 && all, "{:?}", sent);
+
+    // CPU faults turn into the usual signals.
+    let r = run_child(&["illegal"]);
+    check!(t, "invalid opcode is SIGILL", r == killed(ulib::signal::SIGILL), "{:?}", r);
+    let r = run_child(&["divide"]);
+    check!(t, "divide by zero is SIGFPE", r == killed(ulib::signal::SIGFPE), "{:?}", r);
+
+    // Errors.
+    check!(t, "killing init is EPERM", ulib::kill(1, SIGTERM) == Err(Errno::EPERM));
+    check!(t, "killing a missing process is ESRCH", ulib::kill(999_999, SIGTERM) == Err(Errno::ESRCH));
+    check!(t, "signal 0 is EINVAL", ulib::kill(ulib::getpid() as i64, 0) == Err(Errno::EINVAL));
+    check!(t, "signal 64 is EINVAL", ulib::kill(ulib::getpid() as i64, 64) == Err(Errno::EINVAL));
+    check!(t, "setpgid of a missing process is ESRCH", ulib::setpgid(999_999, 1) == Err(Errno::ESRCH));
+
+    // The clock: after 2020, and moving.
+    let t1 = ulib::time_ms();
+    ulib::sleep_ms(100);
+    let t2 = ulib::time_ms();
+    check!(t, "time_ms is plausible", t1 > 1_577_836_800_000, "{}", t1);
+    check!(t, "time_ms advances", (90..300).contains(&(t2 - t1)), "{} ms", t2 - t1);
+}
+
 fn leaks(t: &mut Suite) {
     // Children we already collected may still await reaping; let that happen.
     ulib::sleep_ms(50);
@@ -604,7 +795,7 @@ fn leaks(t: &mut Suite) {
     let r = run_child(&["orphan"]);
     ulib::sleep_ms(50); // let the kernel reap
     let after = ulib::sysinfo().tasks;
-    check!(t, "orphaned child leaves no task entry", r == Ok(0) && after == before, "tasks {} -> {}", before, after);
+    check!(t, "orphaned child leaves no task entry", r == exited(0) && after == before, "tasks {} -> {}", before, after);
 
     // A first round lets the kernel heap grow to its working size; after the
     // second, every page must be back.

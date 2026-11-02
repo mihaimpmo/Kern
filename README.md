@@ -17,6 +17,9 @@ kern:/> hello &
 [2] started in background
 kern:/> crash
 [kernel] process 3 killed: Page fault at 0x400012 (address 0xffffffff80000000)
+[3] killed by SIGSEGV
+kern:/> ls /bin | wc -l
+15
 ```
 
 ## What it has
@@ -38,10 +41,12 @@ kern:/> crash
 | Floating point | SSE in user programs, register state saved per task |
 | Files | In-memory VFS (`/bin` from an initramfs, `/tmp`, `/dev`), file descriptors, working directory, redirection |
 | User memory | Demand-paged regions: `brk`, `mmap`/`munmap`/`mprotect`, 8 MiB stack; `Vec`/`String`/`Box` in user programs |
-| Syscalls | 28: processes (spawn with argv, wait, ...), memory (brk, mmap, ...), files (open, read, write, lseek, stat, readdir, mkdir, unlink, chdir, dup2, ...) |
-| Faults | A crashing program is killed; the kernel keeps running |
+| Syscalls | 33: processes (spawn with argv, wait, kill, process groups), memory (brk, mmap, ...), files (open, read, write, lseek, stat, readdir, mkdir, unlink, chdir, dup2, pipe, ...), time |
+| Signals | `kill`, process groups, Ctrl+C interrupts the foreground job; CPU faults kill with SIGSEGV/SIGILL/SIGFPE |
+| Pipes | 64 KiB pipes with EOF and EPIPE, close-on-spawn descriptors |
+| Clock | Date and time from the CMOS real-time clock |
 | Drivers | Framebuffer text console (with ANSI colours), PS/2 keyboard, buffered serial port |
-| User space | `ulib` (mini standard library), a shell (`init`) with history and redirection, `ls`, `cat`, `mkdir`, `rm`, demo programs |
+| User space | `ulib` (mini standard library); a shell (`init`) with pipelines, redirection, job control and history; `ls`, `cat`, `echo`, `wc`, `mkdir`, `rm`, `ps`, `kill`, `sleep`, `date`; demo programs |
 
 ## Project layout
 
@@ -68,7 +73,7 @@ kern/
 │   ├── linker.ld       user programs start at 0x400000
 │   ├── ulib/           syscalls, print!/println!, args, heap allocator, _start, panic handler
 │   ├── init/           the shell
-│   ├── ls/ cat/ mkdir/ rm/  file utilities
+│   ├── ls/ cat/ wc/ ...   utilities: ls cat echo wc mkdir rm ps kill sleep date
 │   ├── hello/          prints with pauses (run several with `hello &`)
 │   ├── spin/           hogs the CPU to show preemption
 │   ├── crash/          writes to kernel memory to show protection
@@ -122,7 +127,7 @@ Nothing is written to the internal disk; the kernel has no disk driver yet.
 
 **Add a user program:** copy `user/hello`, then add it to `members` in `user/Cargo.toml` and `PROGRAMS` in the Makefile. It ends up in `/bin`, and the shell can run it by name, with arguments (`ulib::args()`).
 
-**Add a system call:** add a number and a `sys_*` function in `kernel/src/syscall.rs`, and a wrapper in `user/ulib/src/lib.rs`. Only touch user memory through `copy_from_user` / `copy_to_user`; with SMAP on, anything else faults. Add a check for it to `user/selftest` and run `make test`.
+**Add a system call:** add a number in `syscall_dispatch` (`kernel/src/syscall/mod.rs`) and a handler in `file.rs`, `process.rs` or `memory.rs` next to it, plus a wrapper in `user/ulib`. Only touch user memory through `copy_from_user` / `copy_to_user`; with SMAP on, anything else faults. Add a check for it to `user/selftest` and run `make test`.
 
 **Add a kernel thread:** `task::spawn_kernel("name", function, arg)`.
 
@@ -133,7 +138,7 @@ Nothing is written to the internal disk; the kernel has no disk driver yet.
 1. **SMP, part 2:** per-CPU run queues instead of one shared queue, wake-up IPIs, TLB shootdown.
 2. **PCI enumeration** through ACPI MCFG; it's the gateway to every modern device.
 3. **Storage:** an NVMe or AHCI driver and a FAT32 filesystem under the VFS, so files survive a reboot.
-4. **Pipes, signals (Ctrl+C), `exec`**, then a real libc port.
+4. **`exec`, signal handlers, threads**, then a real libc port.
 5. **USB:** xHCI + HID keyboard.
 6. Reclaim bootloader memory, a buddy allocator for contiguous frames (needed for DMA).
 
@@ -142,4 +147,4 @@ Nothing is written to the internal disk; the kernel has no disk driver yet.
 - **Monolithic:** drivers run inside the kernel, as in Linux.
 - **Address space:** user space is `0x0`–`0x7fff_ffff_ffff`; the kernel half (`0xffff_8000_...` and up) is shared by all processes and not accessible from ring 3.
 - **Locking:** `SpinLock` disables interrupts while held, so interrupt handlers can't deadlock against the code they interrupted. The scheduler is one spinlock around a shared ready queue, held across the context switch and released by the task that resumes.
-- **Process exit:** a process can't free the stack it's running on, so exit marks it a zombie and the scheduler frees its memory on the next switch. The exit code is kept until the parent collects it with `wait`.
+- **Process exit:** a process can't free the stack it's running on, so exit marks it a zombie and the scheduler frees its memory on the next switch. The exit status (code, or the signal that killed it) is kept until the parent collects it with `wait`.

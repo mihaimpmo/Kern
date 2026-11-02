@@ -1,5 +1,5 @@
 //! ls [path...]: list directories (the working directory by default).
-//! Directories are shown with a trailing '/', devices with a trailing '*'.
+//! Directories are shown with a trailing '/', devices with '*', pipes '|'.
 
 #![no_std]
 #![no_main]
@@ -29,6 +29,7 @@ fn suffix(kind: Kind) -> &'static str {
     match kind {
         Kind::Dir => "/",
         Kind::Device => "*",
+        Kind::Pipe => "|",
         Kind::File => "",
     }
 }

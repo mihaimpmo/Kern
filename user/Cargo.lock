@@ -17,6 +17,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "date"
+version = "0.1.0"
+dependencies = [
+ "ulib",
+]
+
+[[package]]
+name = "echo"
+version = "0.1.0"
+dependencies = [
+ "ulib",
+]
+
+[[package]]
 name = "hello"
 version = "0.1.0"
 dependencies = [
@@ -25,6 +39,13 @@ dependencies = [
 
 [[package]]
 name = "init"
+version = "0.1.0"
+dependencies = [
+ "ulib",
+]
+
+[[package]]
+name = "kill"
 version = "0.1.0"
 dependencies = [
  "ulib",
@@ -51,6 +72,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ps"
+version = "0.1.0"
+dependencies = [
+ "ulib",
+]
+
+[[package]]
 name = "rm"
 version = "0.1.0"
 dependencies = [
@@ -59,6 +87,13 @@ dependencies = [
 
 [[package]]
 name = "selftest"
+version = "0.1.0"
+dependencies = [
+ "ulib",
+]
+
+[[package]]
+name = "sleep"
 version = "0.1.0"
 dependencies = [
  "ulib",
@@ -76,4 +111,11 @@ name = "ulib"
 version = "0.1.0"
 dependencies = [
  "linked_list_allocator",
+]
+
+[[package]]
+name = "wc"
+version = "0.1.0"
+dependencies = [
+ "ulib",
 ]

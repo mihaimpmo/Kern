@@ -2,7 +2,7 @@
 # Optional: qemu-system-x86_64 and OVMF to test without real hardware.
 
 LIMINE_VERSION := v11.4.1-binary
-PROGRAMS       := init hello spin crash selftest ls cat mkdir rm
+PROGRAMS       := init hello spin crash selftest ls cat mkdir rm echo ps sleep kill date wc
 ISO            := kern.iso
 TEST_ISO       := kern-test.iso
 # Boot entry tweaks for the test ISO: no menu delay, selftest as pid 1, and
