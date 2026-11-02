@@ -7,17 +7,17 @@ use ulib::{print, println};
 
 const HELP: &str = "\
 commands:
-  help            this text
-  ls              list programs
-  <program>       run a program and wait for it
-  <program> &     run a program in the background
-  ps              list tasks
-  mem             memory usage
-  uptime          time since boot
-  echo <text>     print text
-  sleep <ms>      sleep for a while
-  history         recent commands (Up/Down recall them)
-  clear           clear the screen";
+  help                this text
+  ls                  list programs
+  <program> [args]    run a program and wait for it
+  <program> [args] &  run a program in the background
+  ps                  list tasks
+  mem                 memory usage
+  uptime              time since boot
+  echo <text>         print text
+  sleep <ms>          sleep for a while
+  history             recent commands (Up/Down recall them)
+  clear               clear the screen";
 
 const PROMPT: &str = "\x1b[92mkern\x1b[0m> ";
 const LINE_MAX: usize = 128;
@@ -93,7 +93,7 @@ fn read_line(buf: &mut [u8; LINE_MAX], history: &History) -> usize {
     let mut draft = [0u8; LINE_MAX];
     let mut draft_len = 0;
     loop {
-        let n = ulib::read(&mut key).max(0) as usize;
+        let n = ulib::read(ulib::STDIN, &mut key).unwrap_or(0);
         for &c in &key[..n] {
             match escape {
                 Escape::Esc if c == b'[' => {
@@ -118,7 +118,7 @@ fn read_line(buf: &mut [u8; LINE_MAX], history: &History) -> usize {
                     len = text.len();
                     // Redraw the whole line: back to column 0, clear, prompt, text.
                     print!("\r\x1b[K{}", PROMPT);
-                    ulib::write(1, &buf[..len]);
+                    let _ = ulib::write(ulib::STDOUT, &buf[..len]);
                     continue;
                 }
                 Escape::None => {}
@@ -138,7 +138,7 @@ fn read_line(buf: &mut [u8; LINE_MAX], history: &History) -> usize {
                 0x20..=0x7e if len < buf.len() => {
                     buf[len] = c;
                     len += 1;
-                    ulib::write(1, &[c]);
+                    let _ = ulib::write(ulib::STDOUT, &[c]);
                 }
                 _ => {}
             }
@@ -147,14 +147,25 @@ fn read_line(buf: &mut [u8; LINE_MAX], history: &History) -> usize {
 }
 
 fn run(line: &str, history: &History) {
-    let (cmd, arg) = match line.split_once(' ') {
-        Some((c, a)) => (c, a.trim()),
-        None => (line, ""),
-    };
+    let mut words = [""; ulib::MAX_ARGS];
+    let mut count = 0;
+    for word in line.split_ascii_whitespace() {
+        if count == words.len() {
+            println!("too many words (at most {})", words.len());
+            return;
+        }
+        words[count] = word;
+        count += 1;
+    }
+    let background = count > 0 && words[count - 1] == "&";
+    if background {
+        count -= 1;
+    }
+    let Some((&cmd, args)) = words[..count].split_first() else { return };
+
     match cmd {
-        "" => {}
         "help" => println!("{}", HELP),
-        "echo" => println!("{}", arg),
+        "echo" => println!("{}", Join(args)),
         "clear" => print!("\x1b[2J\x1b[H"),
         "uptime" => {
             let ms = ulib::uptime_ms();
@@ -170,19 +181,19 @@ fn run(line: &str, history: &History) {
                 info.free_memory >> 20
             );
         }
-        "sleep" => match arg.parse::<u64>() {
-            Ok(ms) => ulib::sleep_ms(ms),
-            Err(_) => println!("usage: sleep <ms>"),
+        "sleep" => match args {
+            [ms] if ms.parse::<u64>().is_ok() => ulib::sleep_ms(ms.parse().unwrap()),
+            _ => println!("usage: sleep <ms>"),
         },
         "ls" => {
             let mut buf = [0u8; 512];
-            let n = ulib::programs(&mut buf).max(0) as usize;
-            ulib::write(1, &buf[..n]);
+            let n = ulib::programs(&mut buf).unwrap_or(0);
+            let _ = ulib::write(ulib::STDOUT, &buf[..n]);
         }
         "ps" => {
             let mut buf = [0u8; 2048];
-            let n = ulib::ps(&mut buf).max(0) as usize;
-            ulib::write(1, &buf[..n]);
+            let n = ulib::ps(&mut buf).unwrap_or(0);
+            let _ = ulib::write(ulib::STDOUT, &buf[..n]);
         }
         "history" => {
             for i in 0..history.len() {
@@ -191,26 +202,30 @@ fn run(line: &str, history: &History) {
             }
         }
         "init" => println!("init is already running"),
-        program => {
-            let background = arg == "&";
-            let pid = ulib::spawn(program);
-            if pid == -2 {
-                println!("{}: command not found (try 'help' or 'ls')", program);
-                return;
+        program => match ulib::spawn(program, args) {
+            Err(ulib::Errno::ENOENT) => println!("{}: command not found (try 'help' or 'ls')", program),
+            Err(e) => println!("{}: could not start: {}", program, e),
+            Ok(pid) if background => println!("[{}] started in background", pid),
+            Ok(pid) => match ulib::wait(pid) {
+                Ok(0) => {}
+                Ok(code) => println!("[{}] exited with code {}", pid, code),
+                Err(e) => println!("[{}] could not wait for it: {}", pid, e),
+            },
+        },
+    }
+}
+
+/// Displays words separated by single spaces.
+struct Join<'a>(&'a [&'a str]);
+
+impl core::fmt::Display for Join<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        for (i, word) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str(" ")?;
             }
-            if pid < 0 {
-                println!("{}: could not start (error {})", program, pid);
-                return;
-            }
-            if background {
-                println!("[{}] started in background", pid);
-            } else {
-                match ulib::wait(pid as u64) {
-                    Some(0) => {}
-                    Some(code) => println!("[{}] exited with code {}", pid, code),
-                    None => println!("[{}] could not wait for it", pid),
-                }
-            }
+            f.write_str(word)?;
         }
+        Ok(())
     }
 }

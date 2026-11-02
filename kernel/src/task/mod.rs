@@ -7,7 +7,8 @@
 //! Locking model: the scheduler state is only touched with interrupts
 //! disabled. That is sufficient on one CPU; SMP will need a real lock here.
 
-pub mod elf;
+mod elf;
+pub mod exec;
 
 use crate::arch::{cpu, gdt, percpu};
 use crate::mm::{kstack::KernelStack, vmm, vmm::AddressSpace};
@@ -19,8 +20,6 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub type Pid = u64;
 
 const TIME_SLICE_MS: u32 = 10;
-pub const USER_STACK_TOP: u64 = 0x0000_7fff_ffff_f000;
-const USER_STACK_SIZE: u64 = 64 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum State {
@@ -227,24 +226,16 @@ pub fn spawn_kernel(name: &str, entry: fn(u64), arg: u64) -> Option<Pid> {
     Some(pid)
 }
 
-/// Load an ELF executable into a new address space and start it in ring 3.
-pub fn spawn_user(name: &str, image: &[u8], parent: Option<Pid>) -> Result<Pid, &'static str> {
-    let space = AddressSpace::new().ok_or("out of memory")?;
-    let entry = elf::load(&space, image)?;
-    space
-        .map_anonymous(
-            USER_STACK_TOP - USER_STACK_SIZE,
-            USER_STACK_SIZE,
-            vmm::flags::WRITABLE | vmm::flags::NO_EXECUTE,
-        )
-        .map_err(|_| "out of memory")?;
-
-    let pid = add_task(name, parent, Some(space), user_task_entry, 0).ok_or("out of memory")?;
+/// Load an ELF executable into a new address space and start it in ring 3
+/// with the given arguments (`args[0]` is conventionally the program name).
+pub fn spawn_user(name: &str, image: &[u8], args: &[&[u8]], parent: Option<Pid>) -> Result<Pid, exec::LoadError> {
+    let image = exec::load(image, args)?;
+    let pid = add_task(name, parent, Some(image.space), user_task_entry, 0).ok_or(exec::LoadError::NoMemory)?;
     {
         let _irq = IrqGuard::new();
         let t = sched().tasks.get_mut(&pid).unwrap();
-        t.user_entry = entry;
-        t.user_stack = USER_STACK_TOP - 8; // as if `_start` had been called
+        t.user_entry = image.entry;
+        t.user_stack = image.stack;
     }
     make_ready(pid);
     Ok(pid)
@@ -267,6 +258,9 @@ pub fn exit_current(code: i64) -> ! {
     let s = sched();
     let pid = s.current;
     assert!(pid != 0, "idle task tried to exit");
+    if pid == 1 {
+        crate::power::init_exited(code);
+    }
     // Orphan our children. A child still running, or exited but not yet
     // reaped, is removed by `reap` once it has no parent. A child that was
     // already reaped is only waiting for us to collect its exit code, which

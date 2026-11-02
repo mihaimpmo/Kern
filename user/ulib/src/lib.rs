@@ -1,12 +1,16 @@
 //! ulib: the tiny standard library for Kern user programs.
-//! Programs define `#[no_mangle] fn main() -> i32` and get `print!`, `println!`
-//! and safe wrappers around every system call.
+//!
+//! Programs define `#[no_mangle] fn main() -> i32` and get `print!`,
+//! `println!`, their arguments through `args()`, and safe wrappers around
+//! every system call. Fallible calls return `Result<_, Errno>`.
 
 #![no_std]
 
-use core::arch::asm;
+use core::arch::{asm, global_asm};
 use core::fmt;
+use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
+/// System call numbers; must match `syscall_dispatch` in the kernel.
 pub mod sys {
     pub const EXIT: u64 = 0;
     pub const WRITE: u64 = 1;
@@ -23,74 +27,164 @@ pub mod sys {
     pub const TRY_WAIT: u64 = 12;
 }
 
+/// Raw system call: number in rax, up to six arguments, result in rax.
+///
+/// # Safety
+/// The arguments must be valid for the call being made; pointers are only
+/// checked by the kernel to the extent of "is this the caller's memory".
 #[inline(always)]
-pub unsafe fn syscall3(n: u64, a: u64, b: u64, c: u64) -> i64 {
+pub unsafe fn syscall6(n: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64 {
     let ret: i64;
     asm!("syscall",
          inlateout("rax") n as i64 => ret,
-         in("rdi") a, in("rsi") b, in("rdx") c,
+         in("rdi") a0, in("rsi") a1, in("rdx") a2, in("r10") a3, in("r8") a4, in("r9") a5,
          out("rcx") _, out("r11") _,
          options(nostack));
     ret
 }
 
+#[inline(always)]
+unsafe fn syscall(n: u64, a0: u64, a1: u64, a2: u64) -> i64 {
+    syscall6(n, a0, a1, a2, 0, 0, 0)
+}
+
+// --------------------------------------------------------------------- errors
+
+/// A kernel error number (the positive value; syscalls return it negated).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Errno(pub i64);
+
+impl Errno {
+    pub const ENOENT: Errno = Errno(2);
+    pub const E2BIG: Errno = Errno(7);
+    pub const ENOEXEC: Errno = Errno(8);
+    pub const EBADF: Errno = Errno(9);
+    pub const ECHILD: Errno = Errno(10);
+    pub const ENOMEM: Errno = Errno(12);
+    pub const EFAULT: Errno = Errno(14);
+    pub const ENOSYS: Errno = Errno(38);
+
+    pub fn name(self) -> &'static str {
+        match self.0 {
+            2 => "no such program",
+            7 => "argument list too long",
+            8 => "not an executable",
+            9 => "bad file descriptor",
+            10 => "no such child",
+            12 => "out of memory",
+            14 => "bad address",
+            38 => "not implemented",
+            _ => "unknown error",
+        }
+    }
+}
+
+impl fmt::Debug for Errno {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Errno({}: {})", self.0, self.name())
+    }
+}
+
+impl fmt::Display for Errno {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+fn check(ret: i64) -> Result<u64, Errno> {
+    if ret < 0 {
+        Err(Errno(-ret))
+    } else {
+        Ok(ret as u64)
+    }
+}
+
+// ------------------------------------------------------------------ processes
+
+pub type Pid = u64;
+
 pub fn exit(code: i32) -> ! {
-    unsafe { syscall3(sys::EXIT, code as i64 as u64, 0, 0) };
-    loop {}
+    unsafe { syscall(sys::EXIT, code as i64 as u64, 0, 0) };
+    unreachable!("exit returned")
 }
 
-pub fn write(fd: u64, bytes: &[u8]) -> i64 {
-    unsafe { syscall3(sys::WRITE, fd, bytes.as_ptr() as u64, bytes.len() as u64) }
+pub fn getpid() -> Pid {
+    unsafe { syscall(sys::GETPID, 0, 0, 0) as Pid }
 }
 
-/// Blocks until at least one key is available.
-pub fn read(buf: &mut [u8]) -> i64 {
-    unsafe { syscall3(sys::READ, 0, buf.as_mut_ptr() as u64, buf.len() as u64) }
+/// Most arguments `spawn` accepts (the kernel's limit).
+pub const MAX_ARGS: usize = 64;
+
+/// Start a program by name. `args` become its `argv[1..]`; `argv[0]` is the
+/// name. Returns the new process's pid.
+pub fn spawn(name: &str, args: &[&str]) -> Result<Pid, Errno> {
+    if args.len() + 1 > MAX_ARGS {
+        return Err(Errno::E2BIG);
+    }
+    let mut pairs = [[0u64; 2]; MAX_ARGS];
+    for (pair, arg) in pairs.iter_mut().zip(core::iter::once(&name).chain(args)) {
+        *pair = [arg.as_ptr() as u64, arg.len() as u64];
+    }
+    let argc = args.len() as u64 + 1;
+    let ret = unsafe {
+        syscall6(sys::SPAWN, name.as_ptr() as u64, name.len() as u64, pairs.as_ptr() as u64, argc, 0, 0)
+    };
+    check(ret)
 }
 
-pub fn getpid() -> u64 {
-    unsafe { syscall3(sys::GETPID, 0, 0, 0) as u64 }
+/// Wait for child `pid` to finish and return its exit code.
+pub fn wait(pid: Pid) -> Result<i64, Errno> {
+    let mut code: i64 = 0;
+    check(unsafe { syscall(sys::WAIT, pid, &mut code as *mut i64 as u64, 0) })?;
+    Ok(code)
 }
+
+/// Collect any finished child without blocking: Some((pid, exit code)).
+pub fn try_wait() -> Option<(Pid, i64)> {
+    let mut code: i64 = 0;
+    let pid = unsafe { syscall(sys::TRY_WAIT, &mut code as *mut i64 as u64, 0, 0) };
+    (pid > 0).then_some((pid as Pid, code))
+}
+
+// ------------------------------------------------------------------- time
 
 pub fn sleep_ms(ms: u64) {
-    unsafe { syscall3(sys::SLEEP_MS, ms, 0, 0) };
+    unsafe { syscall(sys::SLEEP_MS, ms, 0, 0) };
 }
 
 pub fn yield_now() {
-    unsafe { syscall3(sys::YIELD, 0, 0, 0) };
+    unsafe { syscall(sys::YIELD, 0, 0, 0) };
 }
 
 pub fn uptime_ms() -> u64 {
-    unsafe { syscall3(sys::UPTIME_MS, 0, 0, 0) as u64 }
+    unsafe { syscall(sys::UPTIME_MS, 0, 0, 0) as u64 }
 }
 
-/// Start a program by name; returns its pid or a negative error.
-pub fn spawn(name: &str) -> i64 {
-    unsafe { syscall3(sys::SPAWN, name.as_ptr() as u64, name.len() as u64, 0) }
+// -------------------------------------------------------------------- I/O
+
+pub const STDIN: u64 = 0;
+pub const STDOUT: u64 = 1;
+pub const STDERR: u64 = 2;
+
+pub fn write(fd: u64, bytes: &[u8]) -> Result<usize, Errno> {
+    check(unsafe { syscall(sys::WRITE, fd, bytes.as_ptr() as u64, bytes.len() as u64) }).map(|n| n as usize)
 }
 
-/// Wait for a child to finish: Some(exit code), or None if `pid` is not a
-/// child of this process. (Exit codes can be negative, so they are returned
-/// through a pointer rather than mixed with error numbers.)
-pub fn wait(pid: u64) -> Option<i64> {
-    let mut code: i64 = 0;
-    let ret = unsafe { syscall3(sys::WAIT, pid, &mut code as *mut i64 as u64, 0) };
-    (ret == 0).then_some(code)
+/// Blocks until at least one byte is available.
+pub fn read(fd: u64, buf: &mut [u8]) -> Result<usize, Errno> {
+    check(unsafe { syscall(sys::READ, fd, buf.as_mut_ptr() as u64, buf.len() as u64) }).map(|n| n as usize)
 }
 
-/// Collect a finished child without blocking: Some((pid, exit code)).
-pub fn try_wait() -> Option<(u64, i64)> {
-    let mut code: i64 = 0;
-    let pid = unsafe { syscall3(sys::TRY_WAIT, &mut code as *mut i64 as u64, 0, 0) };
-    (pid > 0).then_some((pid as u64, code))
+// ------------------------------------------------------------- system info
+
+/// Names of the available programs, one per line. Returns bytes written.
+pub fn programs(buf: &mut [u8]) -> Result<usize, Errno> {
+    check(unsafe { syscall(sys::PROGRAMS, buf.as_mut_ptr() as u64, buf.len() as u64, 0) }).map(|n| n as usize)
 }
 
-pub fn programs(buf: &mut [u8]) -> i64 {
-    unsafe { syscall3(sys::PROGRAMS, buf.as_mut_ptr() as u64, buf.len() as u64, 0) }
-}
-
-pub fn ps(buf: &mut [u8]) -> i64 {
-    unsafe { syscall3(sys::PS, buf.as_mut_ptr() as u64, buf.len() as u64, 0) }
+/// A process table as text. Returns bytes written.
+pub fn ps(buf: &mut [u8]) -> Result<usize, Errno> {
+    check(unsafe { syscall(sys::PS, buf.as_mut_ptr() as u64, buf.len() as u64, 0) }).map(|n| n as usize)
 }
 
 pub struct SysInfo {
@@ -102,18 +196,17 @@ pub struct SysInfo {
 
 pub fn sysinfo() -> SysInfo {
     let mut raw = [0u64; 4];
-    unsafe { syscall3(sys::SYSINFO, raw.as_mut_ptr() as u64, 0, 0) };
+    unsafe { syscall(sys::SYSINFO, raw.as_mut_ptr() as u64, 0, 0) };
     SysInfo { total_memory: raw[0], free_memory: raw[1], uptime_ms: raw[2], tasks: raw[3] }
 }
 
-// ------------------------------------------------------------------- printing
+// ------------------------------------------------------------------ printing
 
 pub struct Stdout;
 
 impl fmt::Write for Stdout {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        write(1, s.as_bytes());
-        Ok(())
+        write(STDOUT, s.as_bytes()).map(|_| ()).map_err(|_| fmt::Error)
     }
 }
 
@@ -132,12 +225,43 @@ macro_rules! println {
     ($($arg:tt)*) => ($crate::print!("{}\n", format_args!($($arg)*)));
 }
 
+// ------------------------------------------------------------------ arguments
+
+static ARGC: AtomicUsize = AtomicUsize::new(0);
+static ARGV: AtomicPtr<*const u8> = AtomicPtr::new(core::ptr::null_mut());
+
+/// The program's arguments, starting with its name. An argument that is not
+/// valid UTF-8 reads as "".
+pub fn args() -> impl ExactSizeIterator<Item = &'static str> {
+    let argv = ARGV.load(Ordering::Relaxed);
+    (0..ARGC.load(Ordering::Relaxed)).map(move |i| unsafe {
+        let s = core::ffi::CStr::from_ptr(*argv.add(i) as *const core::ffi::c_char);
+        s.to_str().unwrap_or("")
+    })
+}
+
 // -------------------------------------------------------------------- runtime
 
+// The kernel starts us with rsp pointing at argc (System V layout, see the
+// kernel's task/exec.rs). Pass that pointer on and get a normal call frame.
+global_asm!(
+    ".global _start",
+    "_start:",
+    "    xor ebp, ebp",
+    "    mov rdi, rsp",
+    "    and rsp, -16",
+    "    call ulib_start",
+    "    ud2",
+);
+
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
+extern "C" fn ulib_start(sp: *const u64) -> ! {
     extern "Rust" {
         fn main() -> i32;
+    }
+    unsafe {
+        ARGC.store(*sp as usize, Ordering::Relaxed);
+        ARGV.store(sp.add(1) as *mut *const u8, Ordering::Relaxed);
     }
     let code = unsafe { main() };
     exit(code)

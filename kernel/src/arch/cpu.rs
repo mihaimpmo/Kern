@@ -15,6 +15,11 @@ pub unsafe fn inb(port: u16) -> u8 {
     value
 }
 
+#[inline]
+pub unsafe fn outl(port: u16, value: u32) {
+    asm!("out dx, eax", in("dx") port, in("eax") value, options(nomem, nostack, preserves_flags));
+}
+
 /// Small delay used by legacy hardware (writes to an unused port).
 #[inline]
 pub unsafe fn io_wait() {

@@ -35,6 +35,7 @@ static PT_LOCK: SpinLock<()> = SpinLock::new(());
 pub enum MapError {
     OutOfMemory,
     AlreadyMapped,
+    NotMapped,
 }
 
 fn table(phys: u64) -> &'static mut [u64; 512] {
@@ -190,6 +191,22 @@ impl AddressSpace {
                 }
             }
             page += PAGE_SIZE;
+        }
+        Ok(())
+    }
+
+    /// Copy `data` to `virt` in this address space, which need not be the
+    /// active one: the copy goes through the HHDM. The pages must be mapped.
+    pub fn write(&self, virt: u64, data: &[u8]) -> Result<(), MapError> {
+        let mut done = 0;
+        while done < data.len() {
+            let va = virt + done as u64;
+            let in_page = ((PAGE_SIZE - va % PAGE_SIZE) as usize).min(data.len() - done);
+            let (pa, _) = translate(self.pml4, va).ok_or(MapError::NotMapped)?;
+            unsafe {
+                core::ptr::copy_nonoverlapping(data.as_ptr().add(done), phys_to_virt(pa) as *mut u8, in_page);
+            }
+            done += in_page;
         }
         Ok(())
     }

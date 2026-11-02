@@ -15,9 +15,11 @@ mod console;
 mod acpi;
 mod arch;
 mod boot;
+mod cmdline;
 mod drivers;
 mod mm;
 mod modules;
+mod power;
 mod sync;
 mod syscall;
 mod task;
@@ -105,12 +107,13 @@ extern "C" fn kmain() -> ! {
     let names = modules::names();
     ok(format_args!("{} program(s) loaded by the bootloader", names.len()));
 
-    match modules::find("init") {
-        Some(image) => match task::spawn_user("init", image, None) {
-            Ok(pid) => ok(format_args!("started init (pid {})", pid)),
-            Err(e) => kprintln!("\x1b[91m[fail]\x1b[0m could not start init: {}", e),
+    let init = cmdline::get("init").unwrap_or("init");
+    match modules::find(init) {
+        Some(image) => match task::spawn_user(init, image, &[init.as_bytes()], None) {
+            Ok(pid) => ok(format_args!("started {} (pid {})", init, pid)),
+            Err(e) => kprintln!("\x1b[91m[fail]\x1b[0m could not start {}: {}", init, e),
         },
-        None => kprintln!("\x1b[93m[warn]\x1b[0m no init program; add one in limine.conf"),
+        None => kprintln!("\x1b[93m[warn]\x1b[0m no program named {}; add it in limine.conf", init),
     }
     kprintln!();
 
@@ -130,7 +133,7 @@ fn ok(msg: impl core::fmt::Display) {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     cpu::cli();
-    drivers::serial::panic_mode();
+    drivers::serial::stop_buffering();
     console::_panic_print(format_args!("\n\x1b[91m*** KERNEL PANIC ***\x1b[0m\n"));
     if let Some(loc) = info.location() {
         console::_panic_print(format_args!("at {}:{}\n", loc.file(), loc.line()));

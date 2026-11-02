@@ -1,15 +1,18 @@
 //! System calls via the `syscall` instruction.
 //!
 //! ABI (same registers as Linux): number in rax, arguments in rdi, rsi, rdx,
-//! r10, r8, r9; result in rax. Negative results are errors.
+//! r10, r8, r9; result in rax. Negative results are -errno.
 //!
 //!   0 exit(code)            6 uptime_ms()
-//!   1 write(fd, buf, len)   7 spawn(name, name_len) -> pid
+//!   1 write(fd, buf, len)   7 spawn(name, name_len, argv, argc) -> pid
 //!   2 read(fd, buf, len)    8 wait(pid, code: *mut i64) -> 0
 //!   3 getpid()              9 programs(buf, len) -> bytes
 //!   4 sleep_ms(ms)         10 sysinfo(buf: *mut [u64; 4])
 //!   5 yield()              11 ps(buf, len) -> bytes
 //!                          12 try_wait(code: *mut i64) -> pid of a finished child, or 0
+//!
+//! `argv` points to `argc` (ptr, len) pairs: one string per argument, not
+//! NUL-terminated. The kernel passes them on in the usual C layout.
 //!
 //! User memory is only ever touched through `copy_from_user` / `copy_to_user`,
 //! which check the pages and open the SMAP window around the copy.
@@ -19,13 +22,15 @@ use crate::arch::gdt;
 use crate::mm::{pmm, vmm, PAGE_SIZE};
 use crate::sync::IrqGuard;
 use crate::{drivers::keyboard, drivers::serial, modules, task};
-use alloc::string::String;
+use crate::task::exec;
+use alloc::{string::String, vec, vec::Vec};
 use core::arch::global_asm;
 use core::fmt::Write;
 
 pub const ENOSYS: i64 = -38;
 pub const EFAULT: i64 = -14;
 pub const ENOENT: i64 = -2;
+pub const E2BIG: i64 = -7;
 pub const ENOEXEC: i64 = -8;
 pub const EBADF: i64 = -9;
 pub const ECHILD: i64 = -10;
@@ -123,7 +128,7 @@ pub fn init() {
 #[no_mangle]
 extern "C" fn syscall_dispatch(f: &mut SyscallFrame) {
     cpu::sti();
-    let (a0, a1, a2) = (f.rdi, f.rsi, f.rdx);
+    let (a0, a1, a2, a3) = (f.rdi, f.rsi, f.rdx, f.r10);
     let ret: i64 = match f.rax {
         0 => task::exit_current(a0 as i64),
         1 => sys_write(a0, a1, a2),
@@ -138,7 +143,7 @@ extern "C" fn syscall_dispatch(f: &mut SyscallFrame) {
             0
         }
         6 => task::uptime_ms() as i64,
-        7 => sys_spawn(a0, a1),
+        7 => sys_spawn(a0, a1, a2, a3),
         8 => sys_wait(a0, a1),
         9 => sys_programs(a0, a1),
         10 => sys_sysinfo(a0),
@@ -156,7 +161,11 @@ extern "C" fn syscall_dispatch(f: &mut SyscallFrame) {
 }
 
 /// Check that [ptr, ptr+len) is mapped user memory (and writable, if asked).
+/// An empty range touches nothing, so any pointer is fine for it.
 fn user_range_ok(ptr: u64, len: u64, write: bool) -> bool {
+    if len == 0 {
+        return true;
+    }
     let Some(end) = ptr.checked_add(len) else { return false };
     if end > vmm::USER_END {
         return false;
@@ -264,19 +273,51 @@ fn sys_read(fd: u64, buf: u64, len: u64) -> i64 {
     }
 }
 
-fn sys_spawn(name: u64, len: u64) -> i64 {
-    let mut buf = [0u8; 256];
-    let Some(bytes) = buf.get_mut(..len as usize) else { return ENOENT };
-    if copy_from_user(bytes, name).is_err() {
+/// Copy a user string described by (ptr, len), at most `max` bytes.
+fn user_bytes(ptr: u64, len: u64, max: usize) -> Result<Vec<u8>, i64> {
+    if len > max as u64 {
+        return Err(E2BIG);
+    }
+    let mut buf = vec![0u8; len as usize];
+    copy_from_user(&mut buf, ptr).map_err(|_| EFAULT)?;
+    Ok(buf)
+}
+
+fn sys_spawn(name: u64, name_len: u64, argv: u64, argc: u64) -> i64 {
+    let name = match user_bytes(name, name_len, 256) {
+        Ok(name) => name,
+        Err(e) => return e,
+    };
+    let Ok(name) = core::str::from_utf8(&name) else { return ENOENT };
+    let Some(image) = modules::find(name) else { return ENOENT };
+
+    if argc > exec::MAX_ARGS as u64 {
+        return E2BIG;
+    }
+    let mut pairs = vec![0u8; argc as usize * 16];
+    if copy_from_user(&mut pairs, argv).is_err() {
         return EFAULT;
     }
-    let Ok(name) = core::str::from_utf8(bytes) else { return ENOENT };
-    let Some(image) = modules::find(name) else { return ENOENT };
-    match task::spawn_user(name, image, Some(task::current_pid())) {
+    let mut args = Vec::with_capacity(argc as usize);
+    for pair in pairs.chunks_exact(16) {
+        let ptr = u64::from_le_bytes(pair[..8].try_into().unwrap());
+        let len = u64::from_le_bytes(pair[8..].try_into().unwrap());
+        match user_bytes(ptr, len, exec::MAX_ARG_BYTES) {
+            Ok(arg) => args.push(arg),
+            Err(e) => return e,
+        }
+    }
+    let args: Vec<&[u8]> = args.iter().map(|a| a.as_slice()).collect();
+
+    match task::spawn_user(name, image, &args, Some(task::current_pid())) {
         Ok(pid) => pid as i64,
         Err(why) => {
             kprintln!("\x1b[91m[kernel] cannot start {}: {}\x1b[0m", name, why);
-            if why == "out of memory" { ENOMEM } else { ENOEXEC }
+            match why {
+                exec::LoadError::NoMemory => ENOMEM,
+                exec::LoadError::ArgsTooLong => E2BIG,
+                exec::LoadError::BadElf(_) => ENOEXEC,
+            }
         }
     }
 }

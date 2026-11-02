@@ -6,8 +6,8 @@
 //! At 115200 baud the port takes ~87 µs per byte, so writing synchronously
 //! (with the console lock held, i.e. interrupts off) would stall the timer
 //! for milliseconds on real hardware. Until the timer runs (`start_buffering`)
-//! and again after a panic (`panic_mode`), writes go straight to the port so
-//! nothing is lost if the kernel stops early.
+//! and again once the system stops (`stop_buffering`: panic, shutdown), writes
+//! go straight to the port so nothing is lost if the kernel stops early.
 
 use crate::arch::cpu::{inb, outb};
 use crate::sync::SpinLock;
@@ -134,9 +134,9 @@ pub fn start_buffering() {
     }
 }
 
-/// Panic path: flush whatever is queued and write synchronously from now on,
-/// since the timer will never drain the ring again.
-pub fn panic_mode() {
+/// Flush whatever is queued and write synchronously from now on. For when the
+/// timer will never drain the ring again (panic, shutdown).
+pub fn stop_buffering() {
     if !BUFFERED.swap(false, Ordering::Relaxed) {
         return;
     }

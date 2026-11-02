@@ -58,13 +58,15 @@ kern/
 │       ├── mm/         pmm (frames), vmm (page tables), heap, kstack
 │       ├── task/       scheduler, context switch, ELF loader
 │       └── drivers/    keyboard, serial
-└── user/
-    ├── linker.ld       user programs start at 0x400000
-    ├── ulib/           syscalls, print!/println!, _start, panic handler
-    ├── init/           the shell
-    ├── hello/          prints with pauses (run several with `hello &`)
-    ├── spin/           hogs the CPU to show preemption
-    └── crash/          writes to kernel memory to show protection
+├── user/
+│   ├── linker.ld       user programs start at 0x400000
+│   ├── ulib/           syscalls, print!/println!, _start, panic handler
+│   ├── init/           the shell
+│   ├── hello/          prints with pauses (run several with `hello &`)
+│   ├── spin/           hogs the CPU to show preemption
+│   ├── crash/          writes to kernel memory to show protection
+│   └── selftest/       kernel checks run by `make test`
+└── tests/run.py        boots the test ISOs in QEMU and checks the results
 ```
 
 ## Building
@@ -86,6 +88,7 @@ Then:
 make            # -> kern.iso
 make run        # test in QEMU, legacy BIOS
 make run-uefi   # test in QEMU, UEFI
+make test       # automated tests in QEMU (needs python3)
 ```
 
 The Makefile sets `RUSTC_BOOTSTRAP=1` so a stable Rust toolchain can rebuild `core`/`alloc` for the bare-metal target. With a nightly toolchain that variable is unnecessary.
@@ -110,9 +113,9 @@ Nothing is written to the internal disk; the kernel has no disk driver yet.
 
 ## Extending it
 
-**Add a user program:** copy `user/hello`, add it to `members` in `user/Cargo.toml`, `PROGRAMS` in the Makefile, and a `module_path` line in `limine.conf`. The shell can then run it by name.
+**Add a user program:** copy `user/hello`, add it to `members` in `user/Cargo.toml`, `PROGRAMS` in the Makefile, and a `module_path` line in `limine.conf`. The shell can then run it by name, with arguments (`ulib::args()`).
 
-**Add a system call:** add a number and a `sys_*` function in `kernel/src/syscall.rs`, and a wrapper in `user/ulib/src/lib.rs`. Only touch user memory through `copy_from_user` / `copy_to_user`; with SMAP on, anything else faults.
+**Add a system call:** add a number and a `sys_*` function in `kernel/src/syscall.rs`, and a wrapper in `user/ulib/src/lib.rs`. Only touch user memory through `copy_from_user` / `copy_to_user`; with SMAP on, anything else faults. Add a check for it to `user/selftest` and run `make test`.
 
 **Add a kernel thread:** `task::spawn_kernel("name", function, arg)`.
 

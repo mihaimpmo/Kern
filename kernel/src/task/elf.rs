@@ -1,6 +1,7 @@
 //! ELF64 loader for user programs (static executables, no dynamic linking).
 
-use crate::mm::{phys_to_virt, vmm, vmm::AddressSpace, PAGE_SIZE};
+use super::exec::LoadError::{self, BadElf};
+use crate::mm::{vmm, vmm::AddressSpace, PAGE_SIZE};
 use core::ptr::read_unaligned;
 
 const PT_LOAD: u32 = 1;
@@ -40,23 +41,23 @@ struct ProgramHeader {
 }
 
 /// Map and copy all loadable segments; returns the entry point.
-pub fn load(space: &AddressSpace, image: &[u8]) -> Result<u64, &'static str> {
+pub fn load(space: &AddressSpace, image: &[u8]) -> Result<u64, LoadError> {
     if image.len() < core::mem::size_of::<Header>() {
-        return Err("file too small");
+        return Err(BadElf("file too small"));
     }
     let h: Header = unsafe { read_unaligned(image.as_ptr() as *const Header) };
     if &h.ident[..4] != b"\x7fELF" || h.ident[4] != 2 || h.ident[5] != 1 {
-        return Err("not a 64-bit little-endian ELF");
+        return Err(BadElf("not a 64-bit little-endian ELF"));
     }
     if h.machine != 0x3E || h.kind != 2 {
-        return Err("not an x86-64 static executable");
+        return Err(BadElf("not an x86-64 static executable"));
     }
     if h.entry >= vmm::USER_END {
-        return Err("entry point outside user space");
+        return Err(BadElf("entry point outside user space"));
     }
     let ph_size = core::mem::size_of::<ProgramHeader>();
     if h.phnum != 0 && (h.phentsize as usize) < ph_size {
-        return Err("bad program header table");
+        return Err(BadElf("bad program header table"));
     }
 
     // All offsets and sizes come from the file, so every sum is checked.
@@ -65,16 +66,16 @@ pub fn load(space: &AddressSpace, image: &[u8]) -> Result<u64, &'static str> {
         let off = (h.phentsize as u64).checked_mul(i).and_then(|o| o.checked_add(h.phoff));
         let off = match off {
             Some(off) if in_image(off, ph_size as u64) => off as usize,
-            _ => return Err("bad program header table"),
+            _ => return Err(BadElf("bad program header table")),
         };
         let ph: ProgramHeader = unsafe { read_unaligned(image.as_ptr().add(off) as *const ProgramHeader) };
         if ph.kind != PT_LOAD || ph.memsz == 0 {
             continue;
         }
-        let end = ph.vaddr.checked_add(ph.memsz).ok_or("segment overflows")?;
+        let end = ph.vaddr.checked_add(ph.memsz).ok_or(BadElf("segment overflows"))?;
         // Page 0 stays unmapped so null pointers in user programs fault.
         if ph.vaddr < PAGE_SIZE || end > vmm::USER_END || ph.filesz > ph.memsz || !in_image(ph.offset, ph.filesz) {
-            return Err("bad segment");
+            return Err(BadElf("bad segment"));
         }
 
         let mut flags = 0;
@@ -84,24 +85,9 @@ pub fn load(space: &AddressSpace, image: &[u8]) -> Result<u64, &'static str> {
         if ph.flags & PF_X == 0 {
             flags |= vmm::flags::NO_EXECUTE;
         }
-        space.map_anonymous(ph.vaddr, ph.memsz, flags).map_err(|_| "out of memory")?;
-
-        // Copy file contents page by page through the HHDM (the new address
-        // space is not active, so we can't just memcpy to the user address).
-        let mut copied = 0;
-        while copied < ph.filesz {
-            let va = ph.vaddr + copied;
-            let in_page = (PAGE_SIZE - (va % PAGE_SIZE)).min(ph.filesz - copied);
-            let (pa, _) = vmm::translate(space.pml4, va).ok_or("mapping vanished")?;
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    image.as_ptr().add((ph.offset + copied) as usize),
-                    phys_to_virt(pa) as *mut u8,
-                    in_page as usize,
-                );
-            }
-            copied += in_page;
-        }
+        space.map_anonymous(ph.vaddr, ph.memsz, flags).map_err(|_| LoadError::NoMemory)?;
+        let contents = &image[ph.offset as usize..(ph.offset + ph.filesz) as usize];
+        space.write(ph.vaddr, contents).map_err(|_| LoadError::NoMemory)?;
     }
     Ok(h.entry)
 }

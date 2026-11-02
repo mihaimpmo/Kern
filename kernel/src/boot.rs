@@ -134,6 +134,21 @@ pub struct RsdpResponse {
 }
 
 #[repr(C)]
+pub struct CmdlineResponse {
+    revision: u64,
+    cmdline: *const c_char,
+}
+
+impl CmdlineResponse {
+    pub fn cmdline(&self) -> &'static str {
+        if self.cmdline.is_null() {
+            return "";
+        }
+        unsafe { CStr::from_ptr(self.cmdline) }.to_str().unwrap_or("")
+    }
+}
+
+#[repr(C)]
 pub struct File {
     revision: u64,
     pub address: *const u8,
@@ -199,6 +214,11 @@ pub static RSDP: Request<RsdpResponse> = Request::new(0xc5e77b6b397e7b43, 0x2763
 #[used]
 #[link_section = ".limine_requests"]
 pub static MODULES: Request<ModuleResponse> = Request::new(0x3e7e279702be32af, 0xca1c4f3bd1280cee);
+
+/// The `cmdline:` line of the boot entry in limine.conf.
+#[used]
+#[link_section = ".limine_requests"]
+pub static CMDLINE: Request<CmdlineResponse> = Request::new(0x4b161536e598651e, 0xb390ad4a2f1f303a);
 
 #[used]
 #[link_section = ".limine_requests_end"]

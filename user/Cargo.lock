@@ -24,6 +24,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "selftest"
+version = "0.1.0"
+dependencies = [
+ "ulib",
+]
+
+[[package]]
 name = "spin"
 version = "0.1.0"
 dependencies = [
