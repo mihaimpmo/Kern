@@ -1,4 +1,5 @@
-//! Synchronisation primitives.
+//! Synchronisation primitives: `SpinLock` (interrupts off, never sleeps),
+//! `Mutex` (sleeps, interrupts on), `BootCell` (written only during boot).
 //!
 //! `SpinLock` uses an atomic flag *and* disables interrupts on the local CPU
 //! while held, so it protects data from other CPUs and from interrupt
@@ -136,5 +137,57 @@ impl<T> BootCell<T> {
 
     pub fn as_ptr(&self) -> *const T {
         self.0.get()
+    }
+}
+
+/// A lock that sleeps instead of spinning, for data held across long
+/// operations (copying file contents) or across calls that may block.
+/// Interrupts stay enabled while it is held, so it must never be taken in an
+/// interrupt handler.
+pub struct Mutex<T> {
+    locked: SpinLock<bool>,
+    waiters: crate::task::WaitQueue,
+    data: UnsafeCell<T>,
+}
+
+unsafe impl<T: Send> Sync for Mutex<T> {}
+unsafe impl<T: Send> Send for Mutex<T> {}
+
+impl<T> Mutex<T> {
+    pub const fn new(value: T) -> Self {
+        Self { locked: SpinLock::new(false), waiters: crate::task::WaitQueue::new(), data: UnsafeCell::new(value) }
+    }
+
+    pub fn lock(&self) -> MutexGuard<'_, T> {
+        let mut locked = self.locked.lock();
+        while *locked {
+            locked = self.waiters.wait(locked);
+        }
+        *locked = true;
+        MutexGuard { mutex: self }
+    }
+}
+
+pub struct MutexGuard<'a, T> {
+    mutex: &'a Mutex<T>,
+}
+
+impl<T> Deref for MutexGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        unsafe { &*self.mutex.data.get() }
+    }
+}
+
+impl<T> DerefMut for MutexGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.mutex.data.get() }
+    }
+}
+
+impl<T> Drop for MutexGuard<'_, T> {
+    fn drop(&mut self) {
+        *self.mutex.locked.lock() = false;
+        self.mutex.waiters.wake_all();
     }
 }

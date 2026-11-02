@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "cat"
+version = "0.1.0"
+dependencies = [
+ "ulib",
+]
+
+[[package]]
 name = "crash"
 version = "0.1.0"
 dependencies = [
@@ -28,6 +35,27 @@ name = "linked_list_allocator"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b23ac50abb8261cb38c6e2a7192d3302e0836dac1628f6a93b82b4fad185897"
+
+[[package]]
+name = "ls"
+version = "0.1.0"
+dependencies = [
+ "ulib",
+]
+
+[[package]]
+name = "mkdir"
+version = "0.1.0"
+dependencies = [
+ "ulib",
+]
+
+[[package]]
+name = "rm"
+version = "0.1.0"
+dependencies = [
+ "ulib",
+]
 
 [[package]]
 name = "selftest"

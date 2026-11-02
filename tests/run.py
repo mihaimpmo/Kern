@@ -74,23 +74,38 @@ def run_selftest(iso, cpu, smp, workdir):
 
 # ---------------------------------------------------------------- shell test
 
-KEYS = {" ": "spc", "&": "shift-7", "-": "minus", ".": "dot", "/": "slash", "_": "shift-minus"}
+KEYS = {" ": "spc", "&": "shift-7", "-": "minus", ".": "dot", "/": "slash", "_": "shift-minus",
+        ">": "shift-dot", "<": "shift-comma"}
 TOKENS = {"<up>": "up", "<down>": "down", "<esc>": "esc", "<bs>": "backspace"}
 
 # (what to type, regex that must newly appear in the output). Typed text is
-# followed by Enter unless it ends in a key token.
+# followed by Enter unless it ends in a key token. PROMPT matches any prompt,
+# for commands whose effect is checked by a later step.
+PROMPT = r"kern:\S*> "
 SHELL_STEPS = [
     ("echo hello   world", r"^hello world$"),
     ("hello 2", r"hello from process \d+ \(2/2\)"),
     ("hello x", r"usage: hello \[count\]"),
     ("crash", r"exited with code -142"),
     ("no-such-thing", r"no-such-thing: command not found"),
-    ("<up><up>", r"kern> crash$"),          # history recall redraws the line
+    ("<up><up>", r"kern:/> crash$"),        # history recall redraws the line
     ("", r"exited with code -142"),          # ...and Enter runs it again
     ("history", r"^\s+\d+\s+no-such-thing$"),
     ("hello 1 &", r"\[\d+\] started in background"),
     ("ps", r"PID\s+PPID\s+STATE\s+CPU\s+NAME"),
     ("echo esc<esc>ok", r"^escok$"),         # a lone Esc doesn't eat keys
+    ("ls /bin", r"^selftest$"),
+    ("echo some text > /tmp/note", PROMPT),
+    ("echo more >> /tmp/note", PROMPT),
+    ("cat /tmp/note", r"^some text\nmore$"),
+    ("cat < /tmp/note", r"^some text\nmore$"),
+    ("mkdir /tmp/dir", PROMPT),
+    ("cd /tmp", r"kern:/tmp> "),
+    ("pwd", r"^/tmp$"),
+    ("ls", r"^dir/\nnote$"),
+    ("rm note dir", PROMPT),
+    ("cat note", r"cat: note: no such file or directory"),
+    ("cd nowhere", r"cd: nowhere: no such file or directory"),
 ]
 
 
@@ -132,7 +147,7 @@ def run_shell(iso, workdir):
 
     ok = True
     try:
-        if not wait_for(log, r"kern> ", 1, BOOT_TIMEOUT):
+        if not wait_for(log, PROMPT, 1, BOOT_TIMEOUT):
             print("  shell: FAILED (no prompt)")
             print(indent(read_log(log)))
             return False

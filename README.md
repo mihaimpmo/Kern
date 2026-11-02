@@ -10,11 +10,12 @@ A small monolithic x86-64 kernel written in Rust. It boots on real PCs (UEFI or 
 [ ok ] scheduler and system calls ready
 [ ok ] 4 CPU(s) online
 [ ok ] PS/2 keyboard
+[ ok ] filesystem: 9 file(s) from the initramfs
 [ ok ] started init (pid 1)
 
-kern> hello &
+kern:/> hello &
 [2] started in background
-kern> crash
+kern:/> crash
 [kernel] process 3 killed: Page fault at 0x400012 (address 0xffffffff80000000)
 ```
 
@@ -35,18 +36,19 @@ kern> crash
 | Scheduler | Preemptive round-robin across all CPUs, 10 ms time slices, sleep, wait queues |
 | User mode | Ring 3 processes loaded from ELF files, `syscall`/`sysret`, arguments (argv) |
 | Floating point | SSE in user programs, register state saved per task |
+| Files | In-memory VFS (`/bin` from an initramfs, `/tmp`, `/dev`), file descriptors, working directory, redirection |
 | User memory | Demand-paged regions: `brk`, `mmap`/`munmap`/`mprotect`, 8 MiB stack; `Vec`/`String`/`Box` in user programs |
-| Syscalls | exit, write, read, getpid, sleep, yield, uptime, spawn, wait, try_wait, ps, sysinfo, list programs, brk, mmap, munmap, mprotect |
+| Syscalls | 28: processes (spawn with argv, wait, ...), memory (brk, mmap, ...), files (open, read, write, lseek, stat, readdir, mkdir, unlink, chdir, dup2, ...) |
 | Faults | A crashing program is killed; the kernel keeps running |
 | Drivers | Framebuffer text console (with ANSI colours), PS/2 keyboard, buffered serial port |
-| User space | `ulib` (mini standard library), a shell (`init`) with command history, demo programs |
+| User space | `ulib` (mini standard library), a shell (`init`) with history and redirection, `ls`, `cat`, `mkdir`, `rm`, demo programs |
 
 ## Project layout
 
 ```
 kern/
 ├── Makefile            builds everything into kern.iso
-├── limine.conf         boot menu + which programs to load
+├── limine.conf         boot menu; loads the kernel and the initramfs
 ├── kernel/
 │   ├── build.rs        generates interrupt stubs, passes linker script
 │   ├── linker.ld       kernel placed at 0xffffffff80000000
@@ -55,8 +57,8 @@ kern/
 │       ├── boot.rs     Limine requests/responses
 │       ├── console.rs  framebuffer + serial console, kprintln!
 │       ├── acpi.rs     finds the MADT (CPUs, interrupt controllers)
-│       ├── syscall.rs  syscall entry (assembly) + every system call
-│       ├── modules.rs  programs provided by the bootloader
+│       ├── syscall/    syscall entry (assembly), dispatch, file/process/memory calls
+│       ├── fs/         VFS, tmpfs, devices, initramfs
 │       ├── sync.rs     SpinLock, IrqGuard
 │       ├── arch/       cpu, gdt, idt, interrupts, apic, percpu, smp
 │       ├── mm/         pmm (frames), vmm (page tables), uspace (process memory), heap, kstack
@@ -66,6 +68,7 @@ kern/
 │   ├── linker.ld       user programs start at 0x400000
 │   ├── ulib/           syscalls, print!/println!, args, heap allocator, _start, panic handler
 │   ├── init/           the shell
+│   ├── ls/ cat/ mkdir/ rm/  file utilities
 │   ├── hello/          prints with pauses (run several with `hello &`)
 │   ├── spin/           hogs the CPU to show preemption
 │   ├── crash/          writes to kernel memory to show protection
@@ -117,7 +120,7 @@ Nothing is written to the internal disk; the kernel has no disk driver yet.
 
 ## Extending it
 
-**Add a user program:** copy `user/hello`, add it to `members` in `user/Cargo.toml`, `PROGRAMS` in the Makefile, and a `module_path` line in `limine.conf`. The shell can then run it by name, with arguments (`ulib::args()`).
+**Add a user program:** copy `user/hello`, then add it to `members` in `user/Cargo.toml` and `PROGRAMS` in the Makefile. It ends up in `/bin`, and the shell can run it by name, with arguments (`ulib::args()`).
 
 **Add a system call:** add a number and a `sys_*` function in `kernel/src/syscall.rs`, and a wrapper in `user/ulib/src/lib.rs`. Only touch user memory through `copy_from_user` / `copy_to_user`; with SMAP on, anything else faults. Add a check for it to `user/selftest` and run `make test`.
 
@@ -129,8 +132,8 @@ Nothing is written to the internal disk; the kernel has no disk driver yet.
 
 1. **SMP, part 2:** per-CPU run queues instead of one shared queue, wake-up IPIs, TLB shootdown.
 2. **PCI enumeration** through ACPI MCFG; it's the gateway to every modern device.
-3. **Storage:** an NVMe or AHCI driver, then a VFS layer and a FAT32 filesystem, so programs can be loaded from disk instead of as boot modules.
-4. **`fork`/`exec`, file descriptors, pipes**, enough to port a real libc later.
+3. **Storage:** an NVMe or AHCI driver and a FAT32 filesystem under the VFS, so files survive a reboot.
+4. **Pipes, signals (Ctrl+C), `exec`**, then a real libc port.
 5. **USB:** xHCI + HID keyboard.
 6. Reclaim bootloader memory, a buddy allocator for contiguous frames (needed for DMA).
 

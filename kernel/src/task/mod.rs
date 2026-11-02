@@ -19,6 +19,7 @@ pub mod exec;
 
 use crate::arch::fpu::FpuState;
 use crate::arch::{cpu, percpu};
+use crate::fs::FdTable;
 use crate::mm::uspace::{FaultResult, UserSpace};
 use crate::mm::{kstack::KernelStack, vmm};
 use crate::sync::{SpinLock, SpinLockGuard};
@@ -49,9 +50,9 @@ pub struct Task {
     exit_code: i64,
     rsp: u64,
     kstack: Option<KernelStack>,
-    /// The process's memory (None for kernel threads). Locked separately
-    /// from the scheduler: syscalls and page faults use it for a long time.
-    space: Option<Arc<SpinLock<UserSpace>>>,
+    /// What the user process owns (None for kernel threads). Locked
+    /// separately from the scheduler.
+    process: Option<Arc<Process>>,
     /// Page tables to load for this task: the space's, or the kernel's.
     pml4: u64,
     /// Saved x87/SSE registers, for user tasks (the kernel doesn't use them).
@@ -72,7 +73,7 @@ impl Task {
             exit_code: 0,
             rsp: 0,
             kstack: None,
-            space: None,
+            process: None,
             pml4: vmm::kernel_pml4(),
             fpu: None,
             wake_at: 0,
@@ -80,6 +81,20 @@ impl Task {
             user_stack: 0,
         }
     }
+}
+
+/// A user process's resources, as opposed to its scheduling state.
+pub struct Process {
+    pub space: SpinLock<UserSpace>,
+    pub files: SpinLock<FdTable>,
+    /// Canonical absolute path of the working directory.
+    pub cwd: SpinLock<String>,
+}
+
+/// What a new process starts with besides its program.
+pub struct Inherit {
+    pub files: FdTable,
+    pub cwd: String,
 }
 
 /// What the scheduler knows about one CPU.
@@ -245,7 +260,7 @@ pub fn add_cpu() {
     s.cpus.push(Cpu { current, idle, slice: TIME_SLICE_MS });
 }
 
-fn add_task(name: &str, parent: Option<Pid>, space: Option<UserSpace>, entry: fn(u64), arg: u64) -> Option<Pid> {
+fn add_task(name: &str, parent: Option<Pid>, process: Option<Process>, entry: fn(u64), arg: u64) -> Option<Pid> {
     let kstack = KernelStack::new()?;
     let rsp = prepare_stack(kstack.top(), entry, arg);
     let mut s = SCHED.lock();
@@ -254,9 +269,9 @@ fn add_task(name: &str, parent: Option<Pid>, space: Option<UserSpace>, entry: fn
     let mut task = Box::new(Task::new(pid, name, parent));
     task.rsp = rsp;
     task.kstack = Some(kstack);
-    if let Some(space) = space {
-        task.pml4 = space.pml4();
-        task.space = Some(Arc::new(SpinLock::new(space)));
+    if let Some(process) = process {
+        task.pml4 = process.space.lock().pml4();
+        task.process = Some(Arc::new(process));
         task.fpu = Some(FpuState::new());
     }
     s.tasks.insert(pid, task);
@@ -273,15 +288,51 @@ pub fn spawn_kernel(name: &str, entry: fn(u64), arg: u64) -> Option<Pid> {
 
 /// Load an ELF executable into a new address space and start it in ring 3
 /// with the given arguments (`args[0]` is conventionally the program name).
-pub fn spawn_user(name: &str, image: &[u8], args: &[&[u8]], parent: Option<Pid>) -> Result<Pid, exec::LoadError> {
+fn spawn_user(
+    name: &str,
+    image: &[u8],
+    args: &[&[u8]],
+    parent: Option<Pid>,
+    inherit: Inherit,
+) -> Result<Pid, exec::LoadError> {
     let image = exec::load(image, args)?;
-    let pid = add_task(name, parent, Some(image.space), user_task_entry, 0).ok_or(exec::LoadError::NoMemory)?;
+    let process = Process {
+        space: SpinLock::new(image.space),
+        files: SpinLock::new(inherit.files),
+        cwd: SpinLock::new(inherit.cwd),
+    };
+    let pid = add_task(name, parent, Some(process), user_task_entry, 0).ok_or(exec::LoadError::NoMemory)?;
     let mut s = SCHED.lock();
     let t = s.tasks.get_mut(&pid).unwrap();
     t.user_entry = image.entry;
     t.user_stack = image.stack;
     s.make_ready(pid);
     Ok(pid)
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum SpawnError {
+    Fs(crate::fs::FsError),
+    Load(exec::LoadError),
+}
+
+impl core::fmt::Display for SpawnError {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        match self {
+            SpawnError::Fs(e) => write!(f, "{:?}", e),
+            SpawnError::Load(e) => write!(f, "{}", e),
+        }
+    }
+}
+
+/// Start the program at `path`, resolved against `inherit.cwd`. A bare name
+/// (no '/') means /bin/<name>. The task is named after the last component.
+pub fn spawn_program(path: &str, args: &[&[u8]], parent: Option<Pid>, inherit: Inherit) -> Result<Pid, SpawnError> {
+    let full = if path.contains('/') { String::from(path) } else { alloc::format!("/bin/{}", path) };
+    let inode = crate::fs::lookup(&inherit.cwd, &full).map_err(SpawnError::Fs)?;
+    let image = crate::fs::read_file(&inode).map_err(SpawnError::Fs)?;
+    let name = full.rsplit('/').next().unwrap_or(&full);
+    spawn_user(name, &image, args, parent, inherit).map_err(SpawnError::Load)
 }
 
 fn user_task_entry(_: u64) {
@@ -296,6 +347,12 @@ fn user_task_entry(_: u64) {
 /// Terminate the running task. Its memory is freed by the scheduler once
 /// we have switched away from its stack.
 pub fn exit_current(code: i64) -> ! {
+    // Close our files now, outside the scheduler lock: closing can wake
+    // other tasks (the reader at the other end of a pipe, say).
+    if let Some(process) = current_process() {
+        let files = process.files.lock().take_all();
+        drop(files);
+    }
     let mut s = SCHED.lock();
     let pid = s.current().pid;
     assert!(pid != 0, "idle task tried to exit");
@@ -385,7 +442,7 @@ fn reap(s: &mut Scheduler) {
         }
         s.zombies.swap_remove(i);
         t.kstack = None; // back to the stack pool
-        t.space = None; // the last reference: frees every page the process owned
+        t.process = None; // the last reference: frees every page the process owned
         let parent = t.parent;
         let orphan = parent.map_or(true, |p| s.tasks.get(&p).map_or(true, |t| t.state == State::Zombie));
         if orphan {
@@ -506,16 +563,16 @@ pub fn current_pid() -> Pid {
     SCHED.lock().current().pid
 }
 
-/// The running process's memory; None for kernel threads. Drop the result
+/// The running user process; None for kernel threads. Drop the result
 /// before exiting: a reference left on a dead task's stack is never dropped.
-pub fn current_space() -> Option<Arc<SpinLock<UserSpace>>> {
-    SCHED.lock().current().space.clone()
+pub fn current_process() -> Option<Arc<Process>> {
+    SCHED.lock().current().process.clone()
 }
 
 /// A page fault from user mode on a page that isn't mapped.
 pub fn user_page_fault(addr: u64, write: bool, exec: bool) -> FaultResult {
-    match current_space() {
-        Some(space) => space.lock().handle_fault(addr, write, exec),
+    match current_process() {
+        Some(process) => process.space.lock().handle_fault(addr, write, exec),
         None => FaultResult::Denied,
     }
 }
@@ -566,22 +623,36 @@ impl WaitQueue {
     /// can be spurious: re-check the condition in a loop.
     pub fn wait<'a, T>(&self, guard: SpinLockGuard<'a, T>) -> SpinLockGuard<'a, T> {
         let mut s = SCHED.lock();
+        // Queue up *before* releasing the caller's lock: whoever changes the
+        // condition next (under that lock) then finds us in `waiters`.
+        self.enqueue_current(&mut s);
         let (lock, irq) = guard.release();
-        self.block_locked(&mut s);
+        schedule(&mut s);
         drop(s);
         lock.lock_with(irq)
     }
 
     /// Sleep on the queue when the condition is scheduler state itself.
     fn block_locked(&self, s: &mut SchedGuard) {
-        let t = s.current();
-        t.state = State::Blocked;
-        self.waiters.lock().push(t.pid);
+        self.enqueue_current(s);
         schedule(s);
     }
 
+    fn enqueue_current(&self, s: &mut Scheduler) {
+        let t = s.current();
+        t.state = State::Blocked;
+        self.waiters.lock().push(t.pid);
+    }
+
     /// Wake every task sleeping on the queue. Don't hold the scheduler lock.
+    /// Call it after changing the condition and releasing its lock.
     pub fn wake_all(&self) {
+        // Cheap when nobody waits: a waiter queues itself before releasing
+        // the condition's lock, so it's either visible here already or will
+        // see the new condition itself.
+        if self.waiters.lock().is_empty() {
+            return;
+        }
         self.wake_all_locked(&mut SCHED.lock());
     }
 

@@ -7,6 +7,9 @@
 
 #![no_std]
 
+extern crate alloc;
+
+pub mod fs;
 pub mod heap;
 
 use core::arch::{asm, global_asm};
@@ -24,7 +27,6 @@ pub mod sys {
     pub const UPTIME_MS: u64 = 6;
     pub const SPAWN: u64 = 7;
     pub const WAIT: u64 = 8;
-    pub const PROGRAMS: u64 = 9;
     pub const SYSINFO: u64 = 10;
     pub const PS: u64 = 11;
     pub const TRY_WAIT: u64 = 12;
@@ -32,6 +34,18 @@ pub mod sys {
     pub const MMAP: u64 = 14;
     pub const MUNMAP: u64 = 15;
     pub const MPROTECT: u64 = 16;
+    pub const OPEN: u64 = 17;
+    pub const CLOSE: u64 = 18;
+    pub const LSEEK: u64 = 19;
+    pub const STAT: u64 = 20;
+    pub const FSTAT: u64 = 21;
+    pub const READDIR: u64 = 22;
+    pub const MKDIR: u64 = 23;
+    pub const UNLINK: u64 = 24;
+    pub const CHDIR: u64 = 25;
+    pub const GETCWD: u64 = 26;
+    pub const DUP: u64 = 27;
+    pub const DUP2: u64 = 28;
 }
 
 /// Raw system call: number in rax, up to six arguments, result in rax.
@@ -51,7 +65,7 @@ pub unsafe fn syscall6(n: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: 
 }
 
 #[inline(always)]
-unsafe fn syscall(n: u64, a0: u64, a1: u64, a2: u64) -> i64 {
+pub(crate) unsafe fn syscall(n: u64, a0: u64, a1: u64, a2: u64) -> i64 {
     syscall6(n, a0, a1, a2, 0, 0, 0)
 }
 
@@ -69,20 +83,34 @@ impl Errno {
     pub const ECHILD: Errno = Errno(10);
     pub const ENOMEM: Errno = Errno(12);
     pub const EFAULT: Errno = Errno(14);
+    pub const EEXIST: Errno = Errno(17);
+    pub const ENOTDIR: Errno = Errno(20);
+    pub const EISDIR: Errno = Errno(21);
     pub const EINVAL: Errno = Errno(22);
+    pub const EMFILE: Errno = Errno(24);
+    pub const ERANGE: Errno = Errno(34);
+    pub const ENAMETOOLONG: Errno = Errno(36);
     pub const ENOSYS: Errno = Errno(38);
+    pub const ENOTEMPTY: Errno = Errno(39);
 
     pub fn name(self) -> &'static str {
         match self.0 {
-            2 => "no such program",
+            2 => "no such file or directory",
             7 => "argument list too long",
             8 => "not an executable",
             9 => "bad file descriptor",
             10 => "no such child",
             12 => "out of memory",
             14 => "bad address",
+            17 => "already exists",
+            20 => "not a directory",
+            21 => "is a directory",
             22 => "invalid argument",
+            24 => "too many open files",
+            34 => "buffer too small",
+            36 => "name too long",
             38 => "not implemented",
+            39 => "directory not empty",
             _ => "unknown error",
         }
     }
@@ -100,7 +128,7 @@ impl fmt::Display for Errno {
     }
 }
 
-fn check(ret: i64) -> Result<u64, Errno> {
+pub(crate) fn check(ret: i64) -> Result<u64, Errno> {
     if ret < 0 {
         Err(Errno(-ret))
     } else {
@@ -124,8 +152,9 @@ pub fn getpid() -> Pid {
 /// Most arguments `spawn` accepts (the kernel's limit).
 pub const MAX_ARGS: usize = 64;
 
-/// Start a program by name. `args` become its `argv[1..]`; `argv[0]` is the
-/// name. Returns the new process's pid.
+/// Start a program: a path, or a bare name meaning /bin/<name>. `args` become
+/// its `argv[1..]`; `argv[0]` is `name`. The child inherits our file
+/// descriptors and working directory. Returns its pid.
 pub fn spawn(name: &str, args: &[&str]) -> Result<Pid, Errno> {
     if args.len() + 1 > MAX_ARGS {
         return Err(Errno::E2BIG);
@@ -175,11 +204,25 @@ pub const STDIN: u64 = 0;
 pub const STDOUT: u64 = 1;
 pub const STDERR: u64 = 2;
 
+/// Write some of `bytes`; returns how many were written.
 pub fn write(fd: u64, bytes: &[u8]) -> Result<usize, Errno> {
     check(unsafe { syscall(sys::WRITE, fd, bytes.as_ptr() as u64, bytes.len() as u64) }).map(|n| n as usize)
 }
 
-/// Blocks until at least one byte is available.
+/// Write all of `bytes`.
+pub fn write_all(fd: u64, mut bytes: &[u8]) -> Result<(), Errno> {
+    while !bytes.is_empty() {
+        let n = write(fd, bytes)?;
+        if n == 0 {
+            return Err(Errno::EINVAL);
+        }
+        bytes = &bytes[n..];
+    }
+    Ok(())
+}
+
+/// Read up to `buf.len()` bytes; 0 means end of file. On the console it
+/// blocks until at least one key is available.
 pub fn read(fd: u64, buf: &mut [u8]) -> Result<usize, Errno> {
     check(unsafe { syscall(sys::READ, fd, buf.as_mut_ptr() as u64, buf.len() as u64) }).map(|n| n as usize)
 }
@@ -228,11 +271,6 @@ pub fn mprotect(addr: *mut u8, len: usize, prot: u64) -> Result<(), Errno> {
 }
 
 // ------------------------------------------------------------- system info
-
-/// Names of the available programs, one per line. Returns bytes written.
-pub fn programs(buf: &mut [u8]) -> Result<usize, Errno> {
-    check(unsafe { syscall(sys::PROGRAMS, buf.as_mut_ptr() as u64, buf.len() as u64, 0) }).map(|n| n as usize)
-}
 
 /// A process table as text. Returns bytes written.
 pub fn ps(buf: &mut [u8]) -> Result<usize, Errno> {

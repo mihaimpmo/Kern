@@ -18,8 +18,8 @@ mod arch;
 mod boot;
 mod cmdline;
 mod drivers;
+mod fs;
 mod mm;
-mod modules;
 mod power;
 mod sync;
 mod syscall;
@@ -105,21 +105,23 @@ extern "C" fn kmain() -> ! {
         kprintln!("\x1b[93m[warn]\x1b[0m no PS/2 keyboard found (USB keyboards are not supported yet)");
     }
 
-    if let Some(mods) = boot::MODULES.response() {
-        for m in mods.modules() {
-            modules::register(m.path(), m.data());
+    fs::init();
+    let mut unpacked = 0;
+    for module in boot::MODULES.response().into_iter().flat_map(|r| r.modules()) {
+        if module.path().ends_with(".tar") {
+            match fs::initramfs::unpack(module.data()) {
+                Ok(files) => unpacked += files,
+                Err(why) => kprintln!("\x1b[91m[fail]\x1b[0m initramfs {}: {}", module.path(), why),
+            }
         }
     }
-    let names = modules::names();
-    ok(format_args!("{} program(s) loaded by the bootloader", names.len()));
+    ok(format_args!("filesystem: {} file(s) from the initramfs", unpacked));
 
     let init = cmdline::get("init").unwrap_or("init");
-    match modules::find(init) {
-        Some(image) => match task::spawn_user(init, image, &[init.as_bytes()], None) {
-            Ok(pid) => ok(format_args!("started {} (pid {})", init, pid)),
-            Err(e) => kprintln!("\x1b[91m[fail]\x1b[0m could not start {}: {}", init, e),
-        },
-        None => kprintln!("\x1b[93m[warn]\x1b[0m no program named {}; add it in limine.conf", init),
+    let inherit = task::Inherit { files: fs::FdTable::with_console(), cwd: alloc::string::String::from("/") };
+    match task::spawn_program(init, &[init.as_bytes()], None, inherit) {
+        Ok(pid) => ok(format_args!("started {} (pid {})", init, pid)),
+        Err(e) => kprintln!("\x1b[91m[fail]\x1b[0m could not start {}: {}", init, e),
     }
     kprintln!();
 

@@ -2,3 +2,4 @@ target/
 iso_root/
 limine/
 *.iso
+build/

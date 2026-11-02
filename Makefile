@@ -2,7 +2,7 @@
 # Optional: qemu-system-x86_64 and OVMF to test without real hardware.
 
 LIMINE_VERSION := v11.4.1-binary
-PROGRAMS       := init hello spin crash selftest
+PROGRAMS       := init hello spin crash selftest ls cat mkdir rm
 ISO            := kern.iso
 TEST_ISO       := kern-test.iso
 # Boot entry tweaks for the test ISO: no menu delay, selftest as pid 1, and
@@ -13,6 +13,8 @@ TEST_CMDLINE   := init=selftest qemu-exit
 export RUSTC_BOOTSTRAP := 1
 
 KERNEL   := kernel/target/x86_64-unknown-none/release/kern
+# Staging area for the initramfs (unpacked into / at boot).
+INITRD   := build/initrd
 USER_DIR := user/target/x86_64-kern-user/release
 OVMF     ?= $(firstword $(wildcard /usr/share/ovmf/OVMF.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/x64/OVMF.4m.fd /usr/share/OVMF/OVMF_CODE_4M.fd))
 
@@ -32,11 +34,13 @@ limine/limine:
 
 # $(call make_iso,OUTPUT,COMMAND): stage everything in iso_root, run COMMAND
 # (to adjust the staged limine.conf), then write a hybrid BIOS/UEFI ISO.
+# Programs go into /bin of the initramfs, a ustar archive Limine loads.
 define make_iso
-	rm -rf iso_root
-	mkdir -p iso_root/boot/limine iso_root/boot/bin iso_root/EFI/BOOT
+	rm -rf iso_root $(INITRD)
+	mkdir -p iso_root/boot/limine iso_root/EFI/BOOT $(INITRD)/bin
 	cp $(KERNEL) iso_root/boot/kernel
-	for p in $(PROGRAMS); do cp $(USER_DIR)/$$p iso_root/boot/bin/$$p.elf; done
+	for p in $(PROGRAMS); do cp $(USER_DIR)/$$p $(INITRD)/bin/$$p; done
+	tar --format=ustar --owner=0 --group=0 --numeric-owner -cf iso_root/boot/initrd.tar -C $(INITRD) bin
 	cp limine.conf limine/limine-bios.sys limine/limine-bios-cd.bin limine/limine-uefi-cd.bin iso_root/boot/limine/
 	cp limine/BOOTX64.EFI limine/BOOTIA32.EFI iso_root/EFI/BOOT/
 	$(2)
@@ -69,7 +73,7 @@ run-uefi: $(ISO)
 	qemu-system-x86_64 -M q35 -m 512M -bios $(OVMF) -cdrom $(ISO) -serial stdio
 
 clean:
-	rm -rf iso_root $(ISO) $(TEST_ISO)
+	rm -rf iso_root build $(ISO) $(TEST_ISO)
 	cd kernel && cargo clean
 	cd user && cargo clean
 
