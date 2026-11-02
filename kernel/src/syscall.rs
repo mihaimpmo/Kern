@@ -7,7 +7,7 @@
 //!   1 write(fd, buf, len)   7 spawn(name, name_len, argv, argc) -> pid
 //!   2 read(fd, buf, len)    8 wait(pid, code: *mut i64) -> 0
 //!   3 getpid()              9 programs(buf, len) -> bytes
-//!   4 sleep_ms(ms)         10 sysinfo(buf: *mut [u64; 4])
+//!   4 sleep_ms(ms)         10 sysinfo(buf: *mut [u64; 5])
 //!   5 yield()              11 ps(buf, len) -> bytes
 //!                          12 try_wait(code: *mut i64) -> pid of a finished child, or 0
 //!
@@ -18,7 +18,7 @@
 //! which check the pages and open the SMAP window around the copy.
 
 use crate::arch::cpu::{self, msr, rdmsr, wrmsr};
-use crate::arch::gdt;
+use crate::arch::{gdt, smp};
 use crate::mm::{pmm, vmm, PAGE_SIZE};
 use crate::sync::IrqGuard;
 use crate::{drivers::keyboard, drivers::serial, modules, task};
@@ -108,6 +108,7 @@ pub struct SyscallFrame {
     rsp: u64,
 }
 
+/// Per CPU: the syscall MSRs are per-CPU registers.
 pub fn init() {
     unsafe {
         wrmsr(msr::EFER, rdmsr(msr::EFER) | 1); // SCE: enable syscall/sysret
@@ -345,8 +346,8 @@ fn sys_programs(buf: u64, len: u64) -> i64 {
 
 fn sys_sysinfo(buf: u64) -> i64 {
     let (free, total) = pmm::stats();
-    let fields = [total, free, task::uptime_ms(), task::list().len() as u64];
-    let mut out = [0u8; 32];
+    let fields = [total, free, task::uptime_ms(), task::list().len() as u64, smp::online() as u64];
+    let mut out = [0u8; 40];
     for (i, v) in fields.iter().enumerate() {
         out[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
     }
@@ -358,10 +359,12 @@ fn sys_sysinfo(buf: u64) -> i64 {
 
 fn sys_ps(buf: u64, len: u64) -> i64 {
     let mut text = String::new();
-    let _ = writeln!(text, "  PID  PPID  STATE     NAME");
-    for (pid, parent, state, name) in task::list() {
-        let ppid = parent.map_or(String::from("-"), |p| alloc::format!("{}", p));
-        let _ = writeln!(text, "{:>5} {:>5}  {:<9} {}", pid, ppid, alloc::format!("{:?}", state), name);
+    let _ = writeln!(text, "  PID  PPID  STATE     CPU  NAME");
+    for t in task::list() {
+        let ppid = t.parent.map_or(String::from("-"), |p| alloc::format!("{}", p));
+        let cpu = t.cpu.map_or(String::from("-"), |c| alloc::format!("{}", c));
+        let state = alloc::format!("{:?}", t.state);
+        let _ = writeln!(text, "{:>5} {:>5}  {:<9} {:>3}  {}", t.pid, ppid, state, cpu, t.name);
     }
     copy_out(&text, buf, len)
 }

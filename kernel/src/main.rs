@@ -1,9 +1,10 @@
 //! Kern: a small monolithic x86-64 kernel.
 //!
-//! Boot order: serial -> framebuffer console -> GDT/IDT -> SMEP/SMAP/UMIP ->
-//! physical memory -> paging -> heap -> ACPI/APIC -> timer -> syscalls ->
-//! scheduler -> keyboard -> first user program (`init`) -> buffered serial
-//! output -> idle loop.
+//! Boot order: serial -> framebuffer console -> boot GDT + IDT ->
+//! SMEP/SMAP/UMIP -> physical memory -> paging -> heap -> per-CPU GDT/TSS ->
+//! ACPI/APIC -> timer -> syscalls -> scheduler -> other CPUs -> keyboard ->
+//! first user program (`init`) -> buffered serial output -> idle loop.
+//! The other CPUs repeat the per-CPU steps in `arch::smp::ap_entry`.
 
 #![no_std]
 #![no_main]
@@ -50,9 +51,8 @@ extern "C" fn kmain() -> ! {
         kprintln!("  display: {}x{}", w, h);
     }
 
-    gdt::init();
+    gdt::load_boot_gdt();
     idt::init();
-    ok("GDT, TSS and IDT loaded");
 
     let prot = cpu::enable_protections();
     let flag = |on: bool, name: &'static str| if on { name } else { "" };
@@ -72,6 +72,8 @@ extern "C" fn kmain() -> ! {
     mm::vmm::init();
     mm::heap::init();
     console::enable_shadow_buffer();
+    percpu::init(0);
+    ok("GDT, TSS and IDT loaded");
     let (free, total) = mm::pmm::stats();
     ok(format_args!("memory: {} MiB usable, {} MiB free", total >> 20, free >> 20));
 
@@ -79,7 +81,7 @@ extern "C" fn kmain() -> ! {
     let madt = acpi::parse_madt(rsdp.address).expect("ACPI MADT not found");
     apic::init(&madt);
     ok(format_args!(
-        "{} APIC, {} I/O APIC(s), {} CPU(s) found (using 1)",
+        "{} APIC, {} I/O APIC(s), {} CPU(s) found",
         if apic::is_x2apic() { "x2" } else { "x" },
         madt.ioapics.len(),
         madt.cpu_count
@@ -88,10 +90,12 @@ extern "C" fn kmain() -> ! {
     let ticks = apic::start_timer();
     ok(format_args!("timer: 1000 Hz (APIC bus ~{} MHz)", ticks * 16 / 1000));
 
-    percpu::init();
     syscall::init();
-    task::init();
+    task::add_cpu();
     ok("scheduler and system calls ready");
+
+    let cpus = arch::smp::start_aps();
+    ok(format_args!("{} CPU(s) online", cpus));
 
     if drivers::keyboard::init(&madt) {
         ok("PS/2 keyboard");
@@ -133,6 +137,9 @@ fn ok(msg: impl core::fmt::Display) {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     cpu::cli();
+    if !power::stop_other_cpus() {
+        cpu::halt_forever(); // another CPU is already panicking or halting
+    }
     drivers::serial::stop_buffering();
     console::_panic_print(format_args!("\n\x1b[91m*** KERNEL PANIC ***\x1b[0m\n"));
     if let Some(loc) = info.location() {

@@ -1,8 +1,9 @@
 //! Interrupt Descriptor Table. Every vector points to a generated stub
 //! (see build.rs) which funnels into `interrupts::interrupt_dispatch`.
+//! One table, filled in once by the boot CPU and loaded by every CPU.
 
 use super::gdt;
-use crate::sync::Racy;
+use crate::sync::BootCell;
 use core::arch::asm;
 use core::mem::size_of;
 
@@ -41,25 +42,33 @@ struct IdtPointer {
     base: u64,
 }
 
-static IDT: Racy<[Entry; 256]> = Racy::new([Entry::EMPTY; 256]);
+static IDT: BootCell<[Entry; 256]> = BootCell::new([Entry::EMPTY; 256]);
 
 extern "C" {
     static isr_stub_table: [u64; 256];
 }
 
+/// Fill in the table and load it. Boot CPU only, during early boot.
+///
+/// NMI, double fault and machine check use IST stacks, which only exist once
+/// the CPU's TSS is loaded (`percpu::init`); before that, those three would
+/// fault again. Every other exception works from the start.
 pub fn init() {
-    unsafe {
-        let idt = &mut *IDT.get();
-        for (vector, entry) in idt.iter_mut().enumerate() {
-            let ist = match vector {
-                2 => gdt::IST_NMI,
-                8 => gdt::IST_DOUBLE_FAULT,
-                18 => gdt::IST_MACHINE_CHECK,
-                _ => 0,
-            };
-            *entry = Entry::new(isr_stub_table[vector], ist);
-        }
-        let ptr = IdtPointer { limit: (size_of::<[Entry; 256]>() - 1) as u16, base: idt.as_ptr() as u64 };
-        asm!("lidt [{}]", in(reg) &ptr, options(readonly, nostack, preserves_flags));
+    let idt = unsafe { IDT.get_mut() };
+    for (vector, entry) in idt.iter_mut().enumerate() {
+        let ist = match vector {
+            2 => gdt::IST_NMI,
+            8 => gdt::IST_DOUBLE_FAULT,
+            18 => gdt::IST_MACHINE_CHECK,
+            _ => 0,
+        };
+        *entry = Entry::new(unsafe { isr_stub_table[vector] }, ist);
     }
+    load();
+}
+
+/// Load the (already filled-in) table on the calling CPU.
+pub fn load() {
+    let ptr = IdtPointer { limit: (size_of::<[Entry; 256]>() - 1) as u16, base: IDT.as_ptr() as u64 };
+    unsafe { asm!("lidt [{}]", in(reg) &ptr, options(readonly, nostack, preserves_flags)) };
 }

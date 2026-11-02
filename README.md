@@ -5,9 +5,10 @@ A small monolithic x86-64 kernel written in Rust. It boots on real PCs (UEFI or 
 ```
 [ ok ] GDT, TSS and IDT loaded
 [ ok ] memory: 2001 MiB usable, 1995 MiB free
-[ ok ] x APIC, 1 I/O APIC(s), 4 CPU(s) found (using 1)
+[ ok ] x APIC, 1 I/O APIC(s), 4 CPU(s) found
 [ ok ] timer: 1000 Hz (APIC bus ~1001 MHz)
 [ ok ] scheduler and system calls ready
+[ ok ] 4 CPU(s) online
 [ ok ] PS/2 keyboard
 [ ok ] started init (pid 1)
 
@@ -30,7 +31,8 @@ kern> crash
 | Kernel stacks | 32 KiB each, with an unmapped guard page below to catch overflows |
 | Interrupts | Local APIC (xAPIC and x2APIC) + I/O APIC, routes taken from ACPI MADT |
 | Timer | APIC timer calibrated against the PIT, 1000 Hz |
-| Scheduler | Preemptive round-robin, 10 ms time slices, sleep, wait queues, idle task |
+| Multi-core | All CPUs run the kernel (Limine MP request), per-CPU GDT/TSS/idle task, panics stop every CPU |
+| Scheduler | Preemptive round-robin across all CPUs, 10 ms time slices, sleep, wait queues |
 | User mode | Ring 3 processes loaded from ELF files, `syscall`/`sysret` |
 | Syscalls | exit, write, read, getpid, sleep, yield, uptime, spawn, wait, try_wait, ps, sysinfo, list programs |
 | Faults | A crashing program is killed; the kernel keeps running |
@@ -54,7 +56,7 @@ kern/
 │       ├── syscall.rs  syscall entry (assembly) + every system call
 │       ├── modules.rs  programs provided by the bootloader
 │       ├── sync.rs     SpinLock, IrqGuard
-│       ├── arch/       cpu, gdt, idt, interrupts, apic, percpu
+│       ├── arch/       cpu, gdt, idt, interrupts, apic, percpu, smp
 │       ├── mm/         pmm (frames), vmm (page tables), heap, kstack
 │       ├── task/       scheduler, context switch, ELF loader
 │       └── drivers/    keyboard, serial
@@ -107,7 +109,7 @@ Nothing is written to the internal disk; the kernel has no disk driver yet.
 
 - **Keyboard:** laptop built-in keyboards are PS/2 internally and work. A USB keyboard usually won't, since there is no USB driver yet. Some firmwares emulate USB keyboards as PS/2 in BIOS (CSM) mode.
 - **Screen:** the console runs at the resolution the firmware chose; text is scaled up on screens ≥1600 px wide.
-- **CPU:** only the first core runs; the others are detected but stay parked.
+- **CPU:** every core runs (up to 64).
 - **Untested path:** if the firmware leaves the CPU in x2APIC mode (common on recent machines), the kernel uses the x2APIC MSR interface. QEMU here couldn't emulate that mode, so this is the first thing to suspect if the boot stops right after the "memory" line.
 - If anything goes wrong, the kernel prints a red `KERNEL PANIC` with the file, line and register dump. A photo of that screen is enough to debug it.
 
@@ -123,7 +125,7 @@ Nothing is written to the internal disk; the kernel has no disk driver yet.
 
 ### Suggested next steps, roughly in order
 
-1. **SMP:** start the other cores (Limine MP request), per-CPU run queues, real locks in the scheduler.
+1. **SMP, part 2:** per-CPU run queues instead of one shared queue, wake-up IPIs, TLB shootdown.
 2. **PCI enumeration** through ACPI MCFG; it's the gateway to every modern device.
 3. **Storage:** an NVMe or AHCI driver, then a VFS layer and a FAT32 filesystem, so programs can be loaded from disk instead of as boot modules.
 4. **User memory:** `mmap`/`brk` syscalls, then a heap allocator in `ulib`.
@@ -135,5 +137,5 @@ Nothing is written to the internal disk; the kernel has no disk driver yet.
 
 - **Monolithic:** drivers run inside the kernel, as in Linux.
 - **Address space:** user space is `0x0`–`0x7fff_ffff_ffff`; the kernel half (`0xffff_8000_...` and up) is shared by all processes and not accessible from ring 3.
-- **Locking:** `SpinLock` disables interrupts while held, so interrupt handlers can't deadlock against the code they interrupted. The scheduler is protected by disabling interrupts, which is correct for one CPU and must become a real lock for SMP.
+- **Locking:** `SpinLock` disables interrupts while held, so interrupt handlers can't deadlock against the code they interrupted. The scheduler is one spinlock around a shared ready queue, held across the context switch and released by the task that resumes.
 - **Process exit:** a process can't free the stack it's running on, so exit marks it a zombie and the scheduler frees its memory on the next switch. The exit code is kept until the parent collects it with `wait`.

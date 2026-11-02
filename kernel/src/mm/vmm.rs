@@ -22,6 +22,7 @@ pub mod flags {
 use flags::*;
 
 const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
+const EFER_NXE: u64 = 1 << 11;
 pub const USER_END: u64 = 0x0000_8000_0000_0000;
 
 static KERNEL_PML4: AtomicU64 = AtomicU64::new(0);
@@ -54,7 +55,7 @@ pub fn init() {
     let pml4 = cpu::read_cr3() & ADDR_MASK;
     KERNEL_PML4.store(pml4, Ordering::Relaxed);
     let efer = unsafe { cpu::rdmsr(cpu::msr::EFER) };
-    NX_SUPPORTED.store(efer & (1 << 11) != 0, Ordering::Relaxed);
+    NX_SUPPORTED.store(efer & EFER_NXE != 0, Ordering::Relaxed);
 
     // Pre-create every kernel-half PML4 entry so all address spaces share them.
     let t = table(pml4);
@@ -63,6 +64,14 @@ pub fn init() {
             let frame = pmm::alloc_zeroed_frame().expect("out of memory creating kernel page tables");
             *entry = frame | PRESENT | WRITABLE;
         }
+    }
+}
+
+/// Per-CPU part of `init`, for the other CPUs: turn on NX if the boot CPU
+/// had it, since the shared page tables use the NX bit.
+pub fn init_cpu() {
+    if NX_SUPPORTED.load(Ordering::Relaxed) {
+        unsafe { cpu::wrmsr(cpu::msr::EFER, cpu::rdmsr(cpu::msr::EFER) | EFER_NXE) };
     }
 }
 

@@ -192,12 +192,13 @@ pub struct SysInfo {
     pub free_memory: u64,
     pub uptime_ms: u64,
     pub tasks: u64,
+    pub cpus: u64,
 }
 
 pub fn sysinfo() -> SysInfo {
-    let mut raw = [0u64; 4];
+    let mut raw = [0u64; 5];
     unsafe { syscall(sys::SYSINFO, raw.as_mut_ptr() as u64, 0, 0) };
-    SysInfo { total_memory: raw[0], free_memory: raw[1], uptime_ms: raw[2], tasks: raw[3] }
+    SysInfo { total_memory: raw[0], free_memory: raw[1], uptime_ms: raw[2], tasks: raw[3], cpus: raw[4] }
 }
 
 // ------------------------------------------------------------------ printing

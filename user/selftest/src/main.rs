@@ -94,6 +94,7 @@ fn run_all() -> i32 {
     syscall_errors(&mut t);
     processes(&mut t);
     timing(&mut t);
+    multicore(&mut t);
     leaks(&mut t);
     println!("selftest: {} checks, {} failed", t.run, t.failed);
     t.failed as i32
@@ -179,6 +180,48 @@ fn timing(t: &mut Suite) {
     if let Ok(pid) = spinner {
         let _ = ulib::wait(pid);
     }
+}
+
+fn multicore(t: &mut Suite) {
+    let cpus = ulib::sysinfo().cpus;
+    check!(t, "sysinfo reports CPUs", cpus >= 1, "cpus = {}", cpus);
+
+    // Many short-lived processes at once: races in spawn/exit/reap show up
+    // here, especially with several CPUs.
+    let mut all_ok = true;
+    for round in 0..8 {
+        let mut pids = [0; 24];
+        for pid in pids.iter_mut() {
+            *pid = ulib::spawn(NAME, &["exit", "7"]).unwrap_or(0);
+        }
+        for &pid in &pids {
+            let r = ulib::wait(pid);
+            if pid == 0 || r != Ok(7) {
+                println!("  round {}: pid {} -> {:?}", round, pid, r);
+                all_ok = false;
+            }
+        }
+    }
+    check!(t, "spawn storm: 8 x 24 concurrent children", all_ok);
+
+    if cpus < 2 {
+        return;
+    }
+    // N busy children of 300 ms each finish in about 300 ms with N CPUs,
+    // N x 300 ms on one. Accept anything clearly better than serial.
+    let n = cpus.min(4);
+    let start = ulib::uptime_ms();
+    let mut pids = [0; 4];
+    for pid in pids[..n as usize].iter_mut() {
+        *pid = ulib::spawn(NAME, &["spin", "300"]).unwrap_or(0);
+    }
+    for &pid in &pids[..n as usize] {
+        let _ = ulib::wait(pid);
+    }
+    let took = ulib::uptime_ms() - start;
+    let limit = 150 * (n + 1);
+    println!("# {} x 300 ms of busy work took {} ms on {} CPUs", n, took, cpus);
+    check!(t, "busy processes run in parallel", took < limit, "{} x 300 ms took {} ms (limit {})", n, took, limit);
 }
 
 fn leaks(t: &mut Suite) {

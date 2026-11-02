@@ -1,6 +1,6 @@
 //! Common interrupt entry path and dispatch.
 
-use super::{apic, cpu};
+use super::{apic, cpu, percpu};
 use crate::{drivers::keyboard, drivers::serial, task};
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -114,8 +114,11 @@ extern "C" fn interrupt_dispatch(frame: &mut InterruptFrame) {
         0..=31 => exception(frame),
         VECTOR_TIMER => {
             apic::eoi();
-            serial::poll();
-            report_nmis();
+            if percpu::index() == 0 {
+                // Machine-wide chores, done by one CPU.
+                serial::poll();
+                report_nmis();
+            }
             task::timer_tick();
         }
         VECTOR_KEYBOARD => {
@@ -151,7 +154,9 @@ fn exception(frame: &mut InterruptFrame) {
     let cr2 = cpu::read_cr2();
 
     match frame.vector {
-        // Not caused by the code that was running, so never kill it for this.
+        // Either another CPU is stopping the system, or a hardware NMI that
+        // the running code didn't cause, so never kill it for this.
+        2 if crate::power::halting() => cpu::halt_forever(),
         2 => {
             NMI_COUNT.fetch_add(1, Ordering::Relaxed);
             return;

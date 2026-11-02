@@ -1,6 +1,8 @@
-//! Local APIC (timer, EOI) and I/O APIC (routing of device IRQs).
+//! Local APIC (timer, EOI, IPIs) and I/O APIC (routing of device IRQs).
 //! Supports both xAPIC (MMIO) and x2APIC (MSR) mode, since firmware on newer
-//! machines often leaves the CPU in x2APIC mode.
+//! machines often leaves the CPU in x2APIC mode. Every CPU has its own local
+//! APIC at the same address; `init` sets up the shared parts on the boot CPU
+//! and `init_local` the per-CPU ones, on each CPU.
 
 use super::cpu::{self, inb, io_wait, outb, rdmsr, wrmsr};
 use super::interrupts::{VECTOR_LEGACY_PIC_BASE, VECTOR_SPURIOUS, VECTOR_TIMER};
@@ -17,6 +19,8 @@ const REG_ID: u32 = 0x20;
 const REG_TPR: u32 = 0x80;
 const REG_EOI: u32 = 0xB0;
 const REG_SVR: u32 = 0xF0;
+const REG_ICR_LOW: u32 = 0x300;
+const REG_ICR_HIGH: u32 = 0x310;
 const REG_LVT_TIMER: u32 = 0x320;
 const REG_TIMER_INIT: u32 = 0x380;
 const REG_TIMER_CURRENT: u32 = 0x390;
@@ -78,23 +82,22 @@ fn disable_legacy_pic() {
     }
 }
 
+const APIC_BASE_X2APIC: u64 = 1 << 10;
+const APIC_BASE_ENABLE: u64 = 1 << 11;
+
+/// Boot CPU: pick the APIC mode, map the registers and I/O APICs, then set
+/// up this CPU's local APIC.
 pub fn init(madt: &Madt) {
     disable_legacy_pic();
 
-    let base_msr = unsafe { rdmsr(cpu::msr::APIC_BASE) };
-    if base_msr & (1 << 10) != 0 {
+    if unsafe { rdmsr(cpu::msr::APIC_BASE) } & APIC_BASE_X2APIC != 0 {
         // Firmware left the CPU in x2APIC mode (common on newer machines);
         // it can't be switched back to xAPIC, so use the MSR interface.
         X2APIC.store(true, Ordering::Relaxed);
     } else {
-        let virt = vmm::map_mmio(madt.lapic_phys, 0x1000);
-        LAPIC_BASE.store(virt, Ordering::Relaxed);
-        // Make sure the APIC is globally enabled.
-        unsafe { cpu::wrmsr(cpu::msr::APIC_BASE, base_msr | (1 << 11)) };
+        LAPIC_BASE.store(vmm::map_mmio(madt.lapic_phys, 0x1000), Ordering::Relaxed);
     }
-
-    lapic_write(REG_TPR, 0);
-    lapic_write(REG_SVR, 0x100 | VECTOR_SPURIOUS as u32); // software-enable + spurious vector
+    init_local();
 
     let mut ioapics = IOAPICS.lock();
     for io in &madt.ioapics {
@@ -104,6 +107,33 @@ pub fn init(madt: &Madt) {
             ioapic_write(virt, 0x10 + 2 * i, 1 << 16); // masked
         }
         ioapics.push(IoApic { virt, gsi_base: io.gsi_base, count });
+    }
+}
+
+/// Enable the calling CPU's local APIC. All CPUs must be in the mode `init`
+/// chose, since `lapic_read`/`lapic_write` pick the interface globally.
+pub fn init_local() {
+    let base_msr = unsafe { rdmsr(cpu::msr::APIC_BASE) };
+    let x2apic = base_msr & APIC_BASE_X2APIC != 0;
+    assert_eq!(x2apic, is_x2apic(), "CPUs disagree on x2APIC mode");
+    if !x2apic {
+        unsafe { wrmsr(cpu::msr::APIC_BASE, base_msr | APIC_BASE_ENABLE) };
+    }
+    lapic_write(REG_TPR, 0);
+    lapic_write(REG_SVR, 0x100 | VECTOR_SPURIOUS as u32); // software-enable + spurious vector
+}
+
+/// Send an NMI to every CPU except the caller (used to stop them on panic).
+pub fn send_nmi_to_others() {
+    const DELIVERY_NMI: u32 = 0b100 << 8;
+    const LEVEL_ASSERT: u32 = 1 << 14;
+    const ALL_EXCLUDING_SELF: u32 = 0b11 << 18;
+    let low = DELIVERY_NMI | LEVEL_ASSERT | ALL_EXCLUDING_SELF;
+    if is_x2apic() {
+        unsafe { wrmsr(0x800 + (REG_ICR_LOW >> 4), low as u64) }; // one 64-bit register
+    } else {
+        lapic_write(REG_ICR_HIGH, 0);
+        lapic_write(REG_ICR_LOW, low);
     }
 }
 
@@ -122,10 +152,18 @@ pub fn start_timer() -> u64 {
         }
     };
     TICKS_PER_MS.store(ticks_per_ms, Ordering::Relaxed);
+    start_local_timer();
+    ticks_per_ms
+}
 
+/// Start this CPU's timer at 1000 Hz, using the boot CPU's calibration (all
+/// local APIC timers run off the same bus clock).
+pub fn start_local_timer() {
+    let ticks_per_ms = TICKS_PER_MS.load(Ordering::Relaxed);
+    assert!(ticks_per_ms != 0, "timer not calibrated");
+    lapic_write(REG_TIMER_DIVIDE, 0x3); // divide by 16
     lapic_write(REG_LVT_TIMER, VECTOR_TIMER as u32 | (1 << 17)); // periodic
     lapic_write(REG_TIMER_INIT, ticks_per_ms as u32);
-    ticks_per_ms
 }
 
 fn calibrate_with_pit(ms: u64) -> Option<u64> {

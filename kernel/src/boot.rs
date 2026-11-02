@@ -4,6 +4,7 @@
 
 use core::cell::UnsafeCell;
 use core::ffi::{c_char, CStr};
+use core::sync::atomic::AtomicU64;
 
 const COMMON_MAGIC: [u64; 2] = [0xc7b1dd30df4c8b88, 0x0a82e883a194f07b];
 
@@ -148,6 +149,47 @@ impl CmdlineResponse {
     }
 }
 
+/// One CPU as reported by the MP request. Limine parks it until something
+/// is stored in `goto_address`; it then jumps there on its own 64 KiB stack,
+/// with a pointer to this struct in rdi.
+#[repr(C)]
+pub struct MpInfo {
+    pub processor_id: u32,
+    pub lapic_id: u32,
+    _reserved: u64,
+    pub goto_address: AtomicU64,
+    pub extra_argument: AtomicU64,
+}
+
+#[repr(C)]
+pub struct MpResponse {
+    revision: u64,
+    flags: u32,
+    pub bsp_lapic_id: u32,
+    count: u64,
+    cpus: *const *const MpInfo,
+}
+
+impl MpResponse {
+    pub fn cpus(&self) -> impl Iterator<Item = &'static MpInfo> {
+        let cpus = self.cpus;
+        (0..self.count as usize).map(move |i| unsafe { &**cpus.add(i) })
+    }
+}
+
+/// The MP request is the only one with a field after `response`.
+#[repr(C)]
+pub struct MpRequest {
+    request: Request<MpResponse>,
+    flags: u64,
+}
+
+impl MpRequest {
+    pub fn response(&self) -> Option<&'static MpResponse> {
+        self.request.response()
+    }
+}
+
 #[repr(C)]
 pub struct File {
     revision: u64,
@@ -214,6 +256,11 @@ pub static RSDP: Request<RsdpResponse> = Request::new(0xc5e77b6b397e7b43, 0x2763
 #[used]
 #[link_section = ".limine_requests"]
 pub static MODULES: Request<ModuleResponse> = Request::new(0x3e7e279702be32af, 0xca1c4f3bd1280cee);
+
+/// Start the other CPUs parked (flags = 0: leave the APIC mode as is).
+#[used]
+#[link_section = ".limine_requests"]
+pub static MP: MpRequest = MpRequest { request: Request::new(0x95a67b819a1b857e, 0xa0b61b723b6a73e0), flags: 0 };
 
 /// The `cmdline:` line of the boot entry in limine.conf.
 #[used]

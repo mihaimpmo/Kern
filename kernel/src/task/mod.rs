@@ -1,18 +1,25 @@
-//! Tasks and the preemptive round-robin scheduler.
+//! Tasks and the preemptive round-robin scheduler, shared by all CPUs.
 //!
 //! Every task (kernel thread or user process) has its own kernel stack.
 //! Switching tasks = saving callee-saved registers on the old kernel stack,
-//! swapping stack pointers, and popping them from the new one.
+//! swapping stack pointers, and popping them from the new one. Each CPU has
+//! an idle task (pid 0, not in the task table) that runs when nothing else
+//! is ready; ready tasks wait in one queue that every CPU takes work from.
 //!
-//! Locking model: the scheduler state is only touched with interrupts
-//! disabled. That is sufficient on one CPU; SMP will need a real lock here.
+//! Locking: all scheduler state lives in `SCHED`, and the lock is held
+//! across `switch_context`. The task switching away takes it; the task that
+//! resumes releases it, by dropping the guard it held when it last switched
+//! away, or in `task_start` if it has never run. So "mark the old task
+//! ready/blocked" and "stop running on its stack" are a single step as far as
+//! other CPUs can tell: none of them can pick a task up while its registers
+//! are still being saved.
 
 mod elf;
 pub mod exec;
 
-use crate::arch::{cpu, gdt, percpu};
+use crate::arch::{cpu, percpu};
 use crate::mm::{kstack::KernelStack, vmm, vmm::AddressSpace};
-use crate::sync::{IrqGuard, Racy};
+use crate::sync::{SpinLock, SpinLockGuard};
 use alloc::{boxed::Box, collections::BTreeMap, collections::VecDeque, string::String, vec::Vec};
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -35,6 +42,8 @@ pub struct Task {
     pub name: String,
     pub state: State,
     pub parent: Option<Pid>,
+    /// CPU the task is running on, while `state == Running`.
+    pub cpu: Option<usize>,
     exit_code: i64,
     rsp: u64,
     kstack: Option<KernelStack>,
@@ -44,23 +53,76 @@ pub struct Task {
     user_stack: u64,
 }
 
+impl Task {
+    fn new(pid: Pid, name: &str, parent: Option<Pid>) -> Task {
+        Task {
+            pid,
+            name: String::from(name),
+            state: State::Ready,
+            parent,
+            cpu: None,
+            exit_code: 0,
+            rsp: 0,
+            kstack: None,
+            space: None,
+            wake_at: 0,
+            user_entry: 0,
+            user_stack: 0,
+        }
+    }
+}
+
+/// What the scheduler knows about one CPU.
+struct Cpu {
+    /// The task running there: in `tasks`, or this CPU's `idle`. Both are
+    /// boxed, so the pointer stays valid while the task exists, and a task
+    /// is only removed from `tasks` once it can't be current anywhere.
+    current: *mut Task,
+    idle: Box<Task>,
+    slice: u32,
+}
+
 struct Scheduler {
     tasks: BTreeMap<Pid, Box<Task>>,
     ready: VecDeque<Pid>,
     sleeping: Vec<Pid>,
     zombies: Vec<Pid>, // exited, resources not yet freed
-    current: Pid,
+    cpus: Vec<Cpu>,    // indexed by percpu::index()
     next_pid: Pid,
-    slice: u32,
 }
 
-static SCHED: Racy<Option<Scheduler>> = Racy::new(None);
+// The raw `current` pointers are only used with the lock held.
+unsafe impl Send for Scheduler {}
+
+static SCHED: SpinLock<Scheduler> = SpinLock::new(Scheduler {
+    tasks: BTreeMap::new(),
+    ready: VecDeque::new(),
+    sleeping: Vec::new(),
+    zombies: Vec::new(),
+    cpus: Vec::new(),
+    next_pid: 1,
+});
 static TICKS: AtomicU64 = AtomicU64::new(0);
 static CHILD_EXITED: WaitQueue = WaitQueue::new();
 
-fn sched() -> &'static mut Scheduler {
-    debug_assert!(!cpu::interrupts_enabled());
-    unsafe { (*SCHED.get()).as_mut().expect("scheduler not initialised") }
+type SchedGuard = SpinLockGuard<'static, Scheduler>;
+
+impl Scheduler {
+    fn this_cpu(&mut self) -> &mut Cpu {
+        let index = percpu::index();
+        &mut self.cpus[index]
+    }
+
+    fn current(&mut self) -> &mut Task {
+        unsafe { &mut *self.this_cpu().current }
+    }
+
+    fn make_ready(&mut self, pid: Pid) {
+        if let Some(t) = self.tasks.get_mut(&pid) {
+            t.state = State::Ready;
+            self.ready.push_back(pid);
+        }
+    }
 }
 
 // ------------------------------------------------------------ context switch
@@ -132,6 +194,9 @@ enter_user:
 
 #[no_mangle]
 extern "C" fn task_start(arg: u64, entry: u64) -> ! {
+    // We were switched to with the scheduler lock held, and have no guard
+    // of our own to drop (see the module comment).
+    unsafe { SCHED.force_unlock() };
     cpu::sti();
     let f: fn(u64) = unsafe { core::mem::transmute(entry as usize) };
     f(arg);
@@ -158,71 +223,37 @@ fn prepare_stack(top: u64, entry: fn(u64), arg: u64) -> u64 {
 
 // ---------------------------------------------------------------- lifecycle
 
-pub fn init() {
-    let idle = Box::new(Task {
-        pid: 0,
-        name: String::from("idle"),
-        state: State::Running,
-        parent: None,
-        exit_code: 0,
-        rsp: 0,
-        kstack: None, // runs on the boot stack
-        space: None,
-        wake_at: 0,
-        user_entry: 0,
-        user_stack: 0,
-    });
-    let mut tasks = BTreeMap::new();
-    tasks.insert(0, idle);
-    unsafe {
-        *SCHED.get() = Some(Scheduler {
-            tasks,
-            ready: VecDeque::new(),
-            sleeping: Vec::new(),
-            zombies: Vec::new(),
-            current: 0,
-            next_pid: 1,
-            slice: TIME_SLICE_MS,
-        });
-    }
+/// Register the calling CPU with the scheduler; its boot thread becomes its
+/// idle task. CPUs must call this in index order (the boot CPU first).
+pub fn add_cpu() {
+    let mut s = SCHED.lock();
+    assert_eq!(s.cpus.len(), percpu::index(), "CPUs registered out of order");
+    let mut idle = Box::new(Task::new(0, "idle", None)); // runs on the stack it was started on
+    idle.state = State::Running;
+    idle.cpu = Some(percpu::index());
+    let current: *mut Task = &mut *idle;
+    s.cpus.push(Cpu { current, idle, slice: TIME_SLICE_MS });
 }
 
 fn add_task(name: &str, parent: Option<Pid>, space: Option<AddressSpace>, entry: fn(u64), arg: u64) -> Option<Pid> {
     let kstack = KernelStack::new()?;
     let rsp = prepare_stack(kstack.top(), entry, arg);
-    let _irq = IrqGuard::new();
-    let s = sched();
+    let mut s = SCHED.lock();
     let pid = s.next_pid;
     s.next_pid += 1;
-    s.tasks.insert(
-        pid,
-        Box::new(Task {
-            pid,
-            name: String::from(name),
-            state: State::Ready,
-            parent,
-            exit_code: 0,
-            rsp,
-            kstack: Some(kstack),
-            space,
-            wake_at: 0,
-            user_entry: 0,
-            user_stack: 0,
-        }),
-    );
+    let mut task = Box::new(Task::new(pid, name, parent));
+    task.rsp = rsp;
+    task.kstack = Some(kstack);
+    task.space = space;
+    s.tasks.insert(pid, task);
     Some(pid)
-}
-
-fn make_ready(pid: Pid) {
-    let _irq = IrqGuard::new();
-    sched().ready.push_back(pid);
 }
 
 /// Start a kernel thread running `entry(arg)`.
 #[allow(dead_code)]
 pub fn spawn_kernel(name: &str, entry: fn(u64), arg: u64) -> Option<Pid> {
     let pid = add_task(name, None, None, entry, arg)?;
-    make_ready(pid);
+    SCHED.lock().make_ready(pid);
     Some(pid)
 }
 
@@ -231,21 +262,18 @@ pub fn spawn_kernel(name: &str, entry: fn(u64), arg: u64) -> Option<Pid> {
 pub fn spawn_user(name: &str, image: &[u8], args: &[&[u8]], parent: Option<Pid>) -> Result<Pid, exec::LoadError> {
     let image = exec::load(image, args)?;
     let pid = add_task(name, parent, Some(image.space), user_task_entry, 0).ok_or(exec::LoadError::NoMemory)?;
-    {
-        let _irq = IrqGuard::new();
-        let t = sched().tasks.get_mut(&pid).unwrap();
-        t.user_entry = image.entry;
-        t.user_stack = image.stack;
-    }
-    make_ready(pid);
+    let mut s = SCHED.lock();
+    let t = s.tasks.get_mut(&pid).unwrap();
+    t.user_entry = image.entry;
+    t.user_stack = image.stack;
+    s.make_ready(pid);
     Ok(pid)
 }
 
 fn user_task_entry(_: u64) {
     let (rip, rsp) = {
-        let _irq = IrqGuard::new();
-        let s = sched();
-        let t = &s.tasks[&s.current];
+        let mut s = SCHED.lock();
+        let t = s.current();
         (t.user_entry, t.user_stack)
     };
     unsafe { enter_user(rip, rsp) };
@@ -254,19 +282,20 @@ fn user_task_entry(_: u64) {
 /// Terminate the running task. Its memory is freed by the scheduler once
 /// we have switched away from its stack.
 pub fn exit_current(code: i64) -> ! {
-    cpu::cli();
-    let s = sched();
-    let pid = s.current;
+    let mut s = SCHED.lock();
+    let pid = s.current().pid;
     assert!(pid != 0, "idle task tried to exit");
     if pid == 1 {
+        drop(s);
         crate::power::init_exited(code);
     }
     // Orphan our children. A child still running, or exited but not yet
     // reaped, is removed by `reap` once it has no parent. A child that was
     // already reaped is only waiting for us to collect its exit code, which
     // will now never happen, so drop its entry here.
-    let zombies = &s.zombies;
-    s.tasks.retain(|_, t| {
+    let s_ref = &mut *s;
+    let zombies = &s_ref.zombies;
+    s_ref.tasks.retain(|_, t| {
         if t.parent != Some(pid) {
             return true;
         }
@@ -276,177 +305,176 @@ pub fn exit_current(code: i64) -> ! {
         t.parent = None;
         true
     });
-    let t = s.tasks.get_mut(&pid).unwrap();
+    let t = s.current();
     t.state = State::Zombie;
     t.exit_code = code;
     s.zombies.push(pid);
-    wake_all(&CHILD_EXITED);
-    schedule();
+    CHILD_EXITED.wake_all_locked(&mut s);
+    schedule(&mut s);
     unreachable!("zombie task was scheduled");
 }
 
 /// Wait for a child process to exit and return its exit code.
 pub fn wait(pid: Pid) -> Option<i64> {
+    let mut s = SCHED.lock();
     loop {
-        let _irq = IrqGuard::new();
-        let s = sched();
-        let me = s.current;
+        let me = s.current().pid;
         let t = s.tasks.get_mut(&pid)?;
         if t.parent != Some(me) {
             return None;
         }
         if t.state == State::Zombie {
             let code = t.exit_code;
-            t.parent = None; // the reaper removes it once its resources are freed
-            if !s.zombies.contains(&pid) {
-                s.tasks.remove(&pid);
-            }
+            collect(&mut s, pid);
             return Some(code);
         }
-        block_on(&CHILD_EXITED);
+        CHILD_EXITED.block_locked(&mut s);
     }
 }
 
 /// Collect any one exited child without blocking: Some((pid, exit code)).
 pub fn try_wait_any() -> Option<(Pid, i64)> {
-    let _irq = IrqGuard::new();
-    let s = sched();
-    let me = s.current;
-    let pid = s
+    let mut s = SCHED.lock();
+    let me = s.current().pid;
+    let (pid, code) = s
         .tasks
         .values()
         .find(|t| t.parent == Some(me) && t.state == State::Zombie)
-        .map(|t| t.pid)?;
-    let t = s.tasks.get_mut(&pid).unwrap();
-    let code = t.exit_code;
-    t.parent = None;
-    if !s.zombies.contains(&pid) {
-        s.tasks.remove(&pid);
-    }
+        .map(|t| (t.pid, t.exit_code))?;
+    collect(&mut s, pid);
     Some((pid, code))
 }
 
-/// Free kernel stacks and address spaces of exited tasks (never the current one).
+/// The parent has the exit code of zombie `pid`: forget the task, or let the
+/// reaper do so if it still owns resources.
+fn collect(s: &mut Scheduler, pid: Pid) {
+    if s.zombies.contains(&pid) {
+        s.tasks.get_mut(&pid).unwrap().parent = None; // reap removes it
+    } else {
+        s.tasks.remove(&pid);
+    }
+}
+
+/// Free kernel stacks and address spaces of exited tasks. Any zombie except
+/// this CPU's current task is safe: with the lock held, no other CPU can be
+/// running on a zombie's stack (a zombie releases the lock only by switching
+/// away from it).
 fn reap(s: &mut Scheduler) {
-    let current = s.current;
+    let current = s.this_cpu().current;
     let mut i = 0;
     while i < s.zombies.len() {
         let pid = s.zombies[i];
-        if pid == current {
+        let t = s.tasks.get_mut(&pid).unwrap();
+        if core::ptr::eq(&**t, current) {
             i += 1;
             continue;
         }
         s.zombies.swap_remove(i);
-        let parent = {
-            let t = s.tasks.get_mut(&pid).unwrap();
-            t.kstack = None; // unmaps and frees the kernel stack
-            t.space = None; // frees every page the process owned
-            t.parent
-        };
-        let orphan = parent.map_or(true, |p| !s_has(&s.tasks, p));
+        t.kstack = None; // back to the stack pool
+        t.space = None; // frees every page the process owned
+        let parent = t.parent;
+        let orphan = parent.map_or(true, |p| s.tasks.get(&p).map_or(true, |t| t.state == State::Zombie));
         if orphan {
             s.tasks.remove(&pid);
         }
     }
 }
 
-fn s_has(tasks: &BTreeMap<Pid, Box<Task>>, pid: Pid) -> bool {
-    tasks.get(&pid).map_or(false, |t| t.state != State::Zombie)
-}
-
 // ---------------------------------------------------------------- scheduling
 
-/// Pick the next task and switch to it. Must be called with interrupts off.
-pub fn schedule() {
-    let s = sched();
+/// Pick the next task for this CPU and switch to it. Returns when the
+/// calling task is scheduled again, with the lock held again.
+fn schedule(s: &mut SchedGuard) {
     reap(s);
+    let index = percpu::index();
+    let prev_ptr = s.cpus[index].current;
+    let prev = unsafe { &mut *prev_ptr };
+    let prev_running = prev.state == State::Running;
+    let prev_idle = core::ptr::eq(prev_ptr, &*s.cpus[index].idle);
 
-    let prev = s.current;
-    let prev_running = s.tasks[&prev].state == State::Running;
-
-    let next = loop {
+    let next_ptr: *mut Task = loop {
         match s.ready.pop_front() {
-            Some(pid) => {
-                if s.tasks.get(&pid).map_or(false, |t| t.state == State::Ready) {
-                    break pid;
-                }
-            }
-            None => break if prev_running && prev != 0 { prev } else { 0 },
+            Some(pid) => match s.tasks.get_mut(&pid) {
+                Some(t) if t.state == State::Ready => break &mut **t,
+                _ => {} // stale entry: the task exited or was woken twice
+            },
+            None if prev_running && !prev_idle => break prev_ptr,
+            None => break &mut *s.cpus[index].idle,
         }
     };
-
-    if next == prev {
-        s.tasks.get_mut(&prev).unwrap().state = State::Running;
-        s.slice = TIME_SLICE_MS;
+    s.cpus[index].slice = TIME_SLICE_MS;
+    if next_ptr == prev_ptr {
+        prev.state = State::Running;
         return;
     }
 
     if prev_running {
-        s.tasks.get_mut(&prev).unwrap().state = State::Ready;
-        if prev != 0 {
-            s.ready.push_back(prev);
+        prev.state = State::Ready;
+        if !prev_idle {
+            s.ready.push_back(prev.pid);
         }
     }
+    prev.cpu = None;
 
-    let next_task = s.tasks.get_mut(&next).unwrap();
-    next_task.state = State::Running;
-    if let Some(stack) = &next_task.kstack {
-        gdt::set_kernel_stack(stack.top());
+    let next = unsafe { &mut *next_ptr };
+    next.state = State::Running;
+    next.cpu = Some(index);
+    if let Some(stack) = &next.kstack {
         percpu::set_kernel_stack(stack.top());
     }
-    let cr3 = next_task.space.as_ref().map_or(vmm::kernel_pml4(), |a| a.pml4);
+    let cr3 = next.space.as_ref().map_or(vmm::kernel_pml4(), |a| a.pml4);
     if cpu::read_cr3() & !0xfff != cr3 {
         unsafe { cpu::write_cr3(cr3) };
     }
-    let next_rsp = next_task.rsp;
-    let prev_rsp: *mut u64 = &mut s.tasks.get_mut(&prev).unwrap().rsp;
-    s.current = next;
-    s.slice = TIME_SLICE_MS;
-
+    s.cpus[index].current = next_ptr;
+    let (prev_rsp, next_rsp) = (&mut prev.rsp as *mut u64, next.rsp);
     unsafe { switch_context(prev_rsp, next_rsp) };
 }
 
-/// Called from the timer interrupt, 1000 times per second.
+/// Called from the timer interrupt on every CPU, 1000 times per second.
 pub fn timer_tick() {
-    let now = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
-    let s = sched();
+    let mut s = SCHED.lock();
+    if percpu::index() == 0 {
+        let now = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+        wake_sleepers(&mut s, now);
+    }
+    let cpu = s.this_cpu();
+    cpu.slice = cpu.slice.saturating_sub(1);
+    let want_switch = cpu.slice == 0 || core::ptr::eq(cpu.current, &*cpu.idle);
+    if want_switch && !s.ready.is_empty() {
+        schedule(&mut s);
+    }
+}
 
+fn wake_sleepers(s: &mut Scheduler, now: u64) {
     let mut i = 0;
     while i < s.sleeping.len() {
         let pid = s.sleeping[i];
-        match s.tasks.get_mut(&pid) {
-            Some(t) if t.state == State::Sleeping && t.wake_at <= now => {
-                t.state = State::Ready;
-                s.ready.push_back(pid);
+        match s.tasks.get(&pid) {
+            Some(t) if t.state == State::Sleeping && t.wake_at > now => i += 1,
+            Some(t) if t.state == State::Sleeping => {
                 s.sleeping.swap_remove(i);
+                s.make_ready(pid);
             }
-            Some(t) if t.state == State::Sleeping => i += 1,
             _ => {
                 s.sleeping.swap_remove(i);
             }
         }
     }
-
-    s.slice = s.slice.saturating_sub(1);
-    if (s.slice == 0 || s.current == 0) && !s.ready.is_empty() {
-        schedule();
-    }
 }
 
 pub fn yield_now() {
-    let _irq = IrqGuard::new();
-    schedule();
+    schedule(&mut SCHED.lock());
 }
 
 pub fn sleep_ms(ms: u64) {
-    let _irq = IrqGuard::new();
-    let s = sched();
-    let pid = s.current;
-    let t = s.tasks.get_mut(&pid).unwrap();
+    let mut s = SCHED.lock();
+    let t = s.current();
     t.wake_at = uptime_ms().saturating_add(ms.max(1));
     t.state = State::Sleeping;
+    let pid = t.pid;
     s.sleeping.push(pid);
-    schedule();
+    schedule(&mut s);
 }
 
 pub fn uptime_ms() -> u64 {
@@ -454,17 +482,27 @@ pub fn uptime_ms() -> u64 {
 }
 
 pub fn current_pid() -> Pid {
-    let _irq = IrqGuard::new();
-    sched().current
+    SCHED.lock().current().pid
 }
 
-/// (pid, parent, state, name) for every task.
-pub fn list() -> Vec<(Pid, Option<Pid>, State, String)> {
-    let _irq = IrqGuard::new();
-    sched().tasks.values().map(|t| (t.pid, t.parent, t.state, t.name.clone())).collect()
+pub struct TaskInfo {
+    pub pid: Pid,
+    pub parent: Option<Pid>,
+    pub state: State,
+    pub cpu: Option<usize>,
+    pub name: String,
 }
 
-/// The idle loop: runs whenever nothing else is ready.
+/// Every task except the idle tasks.
+pub fn list() -> Vec<TaskInfo> {
+    let s = SCHED.lock();
+    s.tasks
+        .values()
+        .map(|t| TaskInfo { pid: t.pid, parent: t.parent, state: t.state, cpu: t.cpu, name: t.name.clone() })
+        .collect()
+}
+
+/// The idle loop: runs whenever nothing else is ready on this CPU.
 pub fn idle() -> ! {
     loop {
         cpu::sti_hlt();
@@ -473,38 +511,50 @@ pub fn idle() -> ! {
 
 // -------------------------------------------------------------- wait queues
 
-/// A list of tasks sleeping until some event happens.
+/// Tasks sleeping until some event happens, used like a condition variable:
+/// check the condition with its lock held, then `wait` with that lock's
+/// guard. A `wake_all` from another CPU can't slip in between the check and
+/// going to sleep, because `wait` releases the lock only once the task is
+/// already on the queue.
+///
+/// Lock order: the caller's lock, then the scheduler, then `waiters`.
 pub struct WaitQueue {
-    waiters: Racy<Vec<Pid>>,
+    waiters: SpinLock<Vec<Pid>>,
 }
 
 impl WaitQueue {
     pub const fn new() -> Self {
-        Self { waiters: Racy::new(Vec::new()) }
+        Self { waiters: SpinLock::new(Vec::new()) }
     }
-}
 
-/// Put the current task to sleep on `queue`. Call with interrupts disabled,
-/// right after checking the condition you are waiting for.
-pub fn block_on(queue: &WaitQueue) {
-    let _irq = IrqGuard::new();
-    let s = sched();
-    let pid = s.current;
-    unsafe { (*queue.waiters.get()).push(pid) };
-    s.tasks.get_mut(&pid).unwrap().state = State::Blocked;
-    schedule();
-}
+    /// Release `guard`, sleep until woken, then take the lock again. Wakeups
+    /// can be spurious: re-check the condition in a loop.
+    pub fn wait<'a, T>(&self, guard: SpinLockGuard<'a, T>) -> SpinLockGuard<'a, T> {
+        let mut s = SCHED.lock();
+        let (lock, irq) = guard.release();
+        self.block_locked(&mut s);
+        drop(s);
+        lock.lock_with(irq)
+    }
 
-/// Wake every task sleeping on `queue`.
-pub fn wake_all(queue: &WaitQueue) {
-    let _irq = IrqGuard::new();
-    let s = sched();
-    let waiters = unsafe { &mut *queue.waiters.get() };
-    for pid in waiters.drain(..) {
-        if let Some(t) = s.tasks.get_mut(&pid) {
-            if t.state == State::Blocked {
-                t.state = State::Ready;
-                s.ready.push_back(pid);
+    /// Sleep on the queue when the condition is scheduler state itself.
+    fn block_locked(&self, s: &mut SchedGuard) {
+        let t = s.current();
+        t.state = State::Blocked;
+        self.waiters.lock().push(t.pid);
+        schedule(s);
+    }
+
+    /// Wake every task sleeping on the queue. Don't hold the scheduler lock.
+    pub fn wake_all(&self) {
+        self.wake_all_locked(&mut SCHED.lock());
+    }
+
+    fn wake_all_locked(&self, s: &mut Scheduler) {
+        let waiters = core::mem::take(&mut *self.waiters.lock());
+        for pid in waiters {
+            if s.tasks.get(&pid).map_or(false, |t| t.state == State::Blocked) {
+                s.make_ready(pid);
             }
         }
     }

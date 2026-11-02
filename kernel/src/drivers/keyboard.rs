@@ -5,8 +5,8 @@
 
 use crate::acpi::Madt;
 use crate::arch::{apic, cpu::{inb, outb}, interrupts::VECTOR_KEYBOARD};
-use crate::sync::{IrqGuard, Racy, SpinLock};
-use crate::task::{self, WaitQueue};
+use crate::sync::SpinLock;
+use crate::task::WaitQueue;
 
 const DATA: u16 = 0x60;
 const STATUS: u16 = 0x64;
@@ -44,7 +44,8 @@ struct Modifiers {
 }
 
 static BUFFER: SpinLock<Ring> = SpinLock::new(Ring { buf: [0; 256], head: 0, tail: 0 });
-static MODS: Racy<Modifiers> = Racy::new(Modifiers { shift: false, ctrl: false, caps: false, extended: false });
+/// Only the interrupt handler uses this; the lock just makes that explicit.
+static MODS: SpinLock<Modifiers> = SpinLock::new(Modifiers { shift: false, ctrl: false, caps: false, extended: false });
 static READERS: WaitQueue = WaitQueue::new();
 
 fn wait_input_clear() -> bool {
@@ -107,7 +108,7 @@ const SHIFTED: &[u8; 58] = b"\0\x1b!@#$%^&*()_+\x08\tQWERTYUIOP{}\n\0ASDFGHJKL:\
 
 pub fn handle_interrupt() {
     let code = unsafe { inb(DATA) };
-    let mods = unsafe { &mut *MODS.get() };
+    let mut mods = MODS.lock();
 
     if code == 0xE0 {
         mods.extended = true;
@@ -131,6 +132,7 @@ pub fn handle_interrupt() {
                 0x4B => b"\x1b[D",
                 _ => b"",
             };
+            drop(mods);
             push_bytes(seq);
         }
         _ if (key as usize) < NORMAL.len() => {
@@ -141,6 +143,7 @@ pub fn handle_interrupt() {
             if mods.ctrl && c.is_ascii_alphabetic() {
                 c = c.to_ascii_lowercase() - b'a' + 1; // Ctrl+C = 3, ...
             }
+            drop(mods);
             if c != 0 {
                 push_bytes(&[c]);
             }
@@ -159,7 +162,7 @@ fn push_bytes(bytes: &[u8]) {
             buf.push(b);
         }
     }
-    task::wake_all(&READERS);
+    READERS.wake_all();
 }
 
 /// Read up to `out.len()` bytes, blocking until at least one is available.
@@ -167,25 +170,21 @@ pub fn read(out: &mut [u8]) -> usize {
     if out.is_empty() {
         return 0;
     }
+    let mut buf = BUFFER.lock();
     loop {
-        let _irq = IrqGuard::new();
         let mut n = 0;
-        {
-            let mut buf = BUFFER.lock();
-            while n < out.len() {
-                match buf.pop() {
-                    Some(b) => {
-                        out[n] = b;
-                        n += 1;
-                    }
-                    None => break,
+        while n < out.len() {
+            match buf.pop() {
+                Some(b) => {
+                    out[n] = b;
+                    n += 1;
                 }
+                None => break,
             }
         }
         if n > 0 {
             return n;
         }
-        // Interrupts stay off between the check and sleeping: no lost wakeups.
-        task::block_on(&READERS);
+        buf = READERS.wait(buf);
     }
 }
