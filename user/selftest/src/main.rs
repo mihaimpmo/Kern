@@ -8,7 +8,11 @@
 #![no_std]
 #![no_main]
 
-use ulib::{println, sys, syscall6, Errno};
+extern crate alloc;
+
+use alloc::{boxed::Box, string::String, vec, vec::Vec};
+use core::hint::black_box;
+use ulib::{println, prot, sys, syscall6, Errno};
 
 const NAME: &str = "selftest";
 /// Exit code of a process killed by a page fault: -(128 + vector 14).
@@ -38,6 +42,38 @@ fn main() -> i32 {
                 core::hint::spin_loop();
             }
             0
+        }
+        ["use-after-munmap"] => unsafe {
+            let p = ulib::mmap(4096, prot::READ | prot::WRITE).unwrap();
+            ulib::munmap(p, 4096).unwrap();
+            core::ptr::read_volatile(p) as i32
+        },
+        ["write-readonly"] => unsafe {
+            let p = ulib::mmap(4096, prot::READ | prot::WRITE).unwrap();
+            ulib::mprotect(p, 4096, prot::READ).unwrap();
+            let _ = core::ptr::read_volatile(p); // reading is still fine
+            core::ptr::write_volatile(p, 1);
+            0
+        },
+        ["exec-heap"] => unsafe {
+            // A `ret` instruction in writable memory must not be executable (NX).
+            let p = ulib::mmap(4096, prot::READ | prot::WRITE).unwrap();
+            p.write(0xc3);
+            let f: extern "C" fn() = core::mem::transmute(p);
+            f();
+            0
+        },
+        ["stack", mib] => {
+            // About `mib` MiB of stack: fine below 8 MiB, a fault above.
+            let depth = mib.parse::<u32>().unwrap_or(0) * 256;
+            (recurse(depth) != 0) as i32 // recurse returns 0 when it gets back up
+        }
+        ["hog", mib] => {
+            let mut v = vec![0u8; mib.parse::<usize>().unwrap_or(0) << 20];
+            for i in (0..v.len()).step_by(4096) {
+                v[i] = 1;
+            }
+            (black_box(&v).iter().map(|&b| b as usize).sum::<usize>() != v.len() / 4096) as i32
         }
         ["orphan"] => {
             // Our child finishes (and is cleaned up) while we are alive; then
@@ -95,6 +131,7 @@ fn run_all() -> i32 {
     processes(&mut t);
     timing(&mut t);
     multicore(&mut t);
+    memory(&mut t);
     leaks(&mut t);
     println!("selftest: {} checks, {} failed", t.run, t.failed);
     t.failed as i32
@@ -224,6 +261,127 @@ fn multicore(t: &mut Suite) {
     check!(t, "busy processes run in parallel", took < limit, "{} x 300 ms took {} ms (limit {})", n, took, limit);
 }
 
+/// About 4 KiB of stack per level.
+fn recurse(depth: u32) -> u64 {
+    let buf = black_box([depth as u8; 4000]);
+    if depth == 0 {
+        buf[0] as u64
+    } else {
+        recurse(depth - 1) + buf[1] as u64 - buf[2] as u64
+    }
+}
+
+fn free_memory() -> u64 {
+    ulib::sysinfo().free_memory
+}
+
+fn memory(t: &mut Suite) {
+    // The heap, through the global allocator.
+    let v: Vec<u32> = (0..200_000).collect();
+    let sum: u64 = v.iter().map(|&x| x as u64).sum();
+    check!(t, "Vec of 200k elements", sum == 199_999 * 200_000 / 2, "sum = {}", sum);
+    let mut s = String::new();
+    for i in 0..1000 {
+        s.push_str(if i % 2 == 0 { "ab" } else { "c" });
+    }
+    check!(t, "String growth", s.len() == 1500 && s.ends_with("abc"), "len = {}", s.len());
+    let big = vec![0u8; 16 << 20];
+    check!(t, "16 MiB zeroed Box", big.iter().all(|&b| b == 0));
+    drop(big);
+    let boxes: Vec<Box<[u8; 100]>> = (0..1000).map(|i| Box::new([i as u8; 100])).collect();
+    check!(t, "many small boxes", boxes.iter().enumerate().all(|(i, b)| b[99] == i as u8));
+    drop(boxes);
+
+    // brk: grow, use, shrink; regrown pages come back zeroed.
+    let base = ulib::brk(0);
+    let grown = ulib::brk(base + (64 << 10));
+    unsafe { core::ptr::write_volatile((base + 4096) as *mut u8, 0x5a) };
+    let shrunk = ulib::brk(base);
+    let regrown = ulib::brk(base + (64 << 10));
+    let zero = unsafe { core::ptr::read_volatile((base + 4096) as *const u8) };
+    ulib::brk(base);
+    check!(t, "brk grows and shrinks", grown == base + (64 << 10) && shrunk == base && regrown == grown);
+    check!(t, "regrown brk memory is zeroed", zero == 0, "byte = {:#x}", zero);
+    check!(t, "brk below the heap is refused", ulib::brk(4096) == base);
+
+    // mmap / munmap.
+    match ulib::mmap(4 << 20, prot::READ | prot::WRITE) {
+        Ok(p) => unsafe {
+            for page in 0..1024 {
+                p.add(page * 4096).write_volatile(page as u8);
+            }
+            let ok = (0..1024).all(|page| p.add(page * 4096).read_volatile() == page as u8);
+            check!(t, "4 MiB mmap is usable", ok);
+            check!(t, "munmap", ulib::munmap(p, 4 << 20).is_ok());
+        },
+        Err(e) => check!(t, "4 MiB mmap is usable", false, "{:?}", e),
+    }
+
+    // Pages are only allocated when touched, and munmap gives them back.
+    let before = free_memory();
+    let reserved = ulib::mmap(1 << 30, prot::READ | prot::WRITE);
+    let after_reserve = free_memory();
+    let after_touch = match reserved {
+        Ok(p) => unsafe {
+            p.add(512 << 20).write_volatile(1);
+            free_memory()
+        },
+        Err(_) => 0,
+    };
+    if let Ok(p) = reserved {
+        let _ = unsafe { ulib::munmap(p, 1 << 30) };
+    }
+    let after_unmap = free_memory();
+    check!(t, "reserving 1 GiB costs (almost) nothing", reserved.is_ok() && before - after_reserve < (64 << 10),
+           "{:?}, {} bytes", reserved, before - after_reserve);
+    check!(t, "touching a page allocates it", after_reserve - after_touch >= 4096,
+           "{} bytes", after_reserve - after_touch);
+    check!(t, "munmap frees touched pages", after_unmap + (64 << 10) > before,
+           "{} -> {} bytes free", before, after_unmap);
+
+    // The kernel can write into memory the process hasn't touched yet.
+    let p = ulib::mmap(4096, prot::READ | prot::WRITE).unwrap_or(core::ptr::null_mut());
+    let r = raw(sys::SYSINFO, p as u64, 0, 0);
+    check!(t, "syscall output into untouched memory", r == 0 && unsafe { *(p as *const u64) } > 0, "got {}", r);
+
+    // mprotect keeps contents.
+    unsafe { p.write_volatile(42) };
+    let r1 = ulib::mprotect(p, 4096, prot::NONE);
+    let r2 = raw(sys::WRITE, ulib::STDOUT, p as u64, 1);
+    let r3 = ulib::mprotect(p, 4096, prot::READ | prot::WRITE);
+    let kept = unsafe { p.read_volatile() };
+    check!(t, "kernel can't read PROT_NONE memory", r1.is_ok() && r2 == -Errno::EFAULT.0, "{:?} {}", r1, r2);
+    check!(t, "mprotect keeps contents", r3.is_ok() && kept == 42, "{:?} {}", r3, kept);
+    let _ = unsafe { ulib::munmap(p, 4096) };
+
+    // Bad arguments.
+    let r = ulib::mmap(0, prot::READ);
+    check!(t, "mmap of 0 bytes is EINVAL", r == Err(Errno::EINVAL), "got {:?}", r);
+    let r = unsafe { syscall6(sys::MMAP, 0, 4096, prot::READ, 0x02, 0, 0) }; // not MAP_ANONYMOUS
+    check!(t, "file-backed mmap is EINVAL", r == -Errno::EINVAL.0, "got {}", r);
+    let r = ulib::mmap(4096, 8);
+    check!(t, "unknown prot bits are EINVAL", r == Err(Errno::EINVAL), "got {:?}", r);
+    let r = raw(sys::MUNMAP, 0x1000_0000_0123, 4096, 0);
+    check!(t, "unaligned munmap is EINVAL", r == -Errno::EINVAL.0, "got {}", r);
+    let r = ulib::mprotect(0x1000_0000_0000 as *mut u8, 4096, prot::READ);
+    check!(t, "mprotect of unmapped memory is ENOMEM", r == Err(Errno::ENOMEM), "got {:?}", r);
+    let fixed = ulib::mmap_fixed(0x2000_0000_0000 as *mut u8, 8192, prot::READ | prot::WRITE);
+    check!(t, "MAP_FIXED maps at the address", fixed == Ok(0x2000_0000_0000 as *mut u8), "got {:?}", fixed);
+    if let Ok(p) = fixed {
+        let _ = unsafe { ulib::munmap(p, 8192) };
+    }
+
+    // Faults that must kill, and stack use that must not.
+    for mode in ["use-after-munmap", "write-readonly", "exec-heap"] {
+        let r = run_child(&[mode]);
+        check!(t, mode, r == Ok(PAGE_FAULT_EXIT), "got {:?}", r);
+    }
+    let r = run_child(&["stack", "6"]);
+    check!(t, "6 MiB of stack works", r == Ok(0), "got {:?}", r);
+    let r = run_child(&["stack", "9"]);
+    check!(t, "stack overflow is a fault", r == Ok(PAGE_FAULT_EXIT), "got {:?}", r);
+}
+
 fn leaks(t: &mut Suite) {
     // Children we already collected may still await reaping; let that happen.
     ulib::sleep_ms(50);
@@ -239,6 +397,7 @@ fn leaks(t: &mut Suite) {
         for _ in 0..8 {
             let _ = run_child(&["exit", "0"]);
         }
+        let _ = run_child(&["hog", "32"]);
         ulib::sleep_ms(20);
     };
     round();

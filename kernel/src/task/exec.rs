@@ -10,11 +10,8 @@
 //!   ...the strings themselves, near the top of the stack
 
 use super::elf;
-use crate::mm::{vmm, vmm::AddressSpace};
+use crate::mm::uspace::{MemError, Prot, UserSpace, STACK_BOTTOM, STACK_TOP};
 use alloc::vec::Vec;
-
-pub const USER_STACK_TOP: u64 = 0x0000_7fff_ffff_f000;
-const USER_STACK_SIZE: u64 = 64 * 1024;
 
 /// Most arguments a program can be started with, and their total size.
 pub const MAX_ARGS: usize = 64;
@@ -39,7 +36,7 @@ impl core::fmt::Display for LoadError {
 }
 
 pub struct Image {
-    pub space: AddressSpace,
+    pub space: UserSpace,
     pub entry: u64,
     pub stack: u64,
 }
@@ -48,24 +45,22 @@ pub fn load(elf_image: &[u8], args: &[&[u8]]) -> Result<Image, LoadError> {
     if args.len() > MAX_ARGS || args.iter().map(|a| a.len() + 1).sum::<usize>() > MAX_ARG_BYTES {
         return Err(LoadError::ArgsTooLong);
     }
-    let space = AddressSpace::new().ok_or(LoadError::NoMemory)?;
-    let entry = elf::load(&space, elf_image)?;
-    let stack_flags = vmm::flags::WRITABLE | vmm::flags::NO_EXECUTE;
-    space
-        .map_anonymous(USER_STACK_TOP - USER_STACK_SIZE, USER_STACK_SIZE, stack_flags)
-        .map_err(|_| LoadError::NoMemory)?;
-    let stack = write_entry_block(&space, args).map_err(|_| LoadError::NoMemory)?;
-    Ok(Image { space, entry, stack })
+    let mut space = UserSpace::new().ok_or(LoadError::NoMemory)?;
+    let program = elf::load(&mut space, elf_image)?;
+    space.set_heap_start(program.end);
+    space.add_region(STACK_BOTTOM, STACK_TOP, Prot::RW).map_err(|_| LoadError::NoMemory)?;
+    let stack = write_entry_block(&mut space, args).map_err(|_| LoadError::NoMemory)?;
+    Ok(Image { space, entry: program.entry, stack })
 }
 
-fn write_entry_block(space: &AddressSpace, args: &[&[u8]]) -> Result<u64, vmm::MapError> {
+fn write_entry_block(space: &mut UserSpace, args: &[&[u8]]) -> Result<u64, MemError> {
     // Strings first, from the top down.
-    let mut sp = USER_STACK_TOP;
+    let mut sp = STACK_TOP;
     let mut pointers = Vec::with_capacity(args.len());
     for arg in args.iter().rev() {
         sp -= arg.len() as u64 + 1;
-        space.write(sp, arg)?;
-        space.write(sp + arg.len() as u64, &[0])?;
+        space.load(sp, arg)?;
+        space.load(sp + arg.len() as u64, &[0])?;
         pointers.push(sp);
     }
     pointers.reverse();
@@ -78,6 +73,6 @@ fn write_entry_block(space: &AddressSpace, args: &[&[u8]]) -> Result<u64, vmm::M
 
     sp = (sp - block.len() as u64 * 8) & !0xf;
     let bytes: Vec<u8> = block.iter().flat_map(|w| w.to_le_bytes()).collect();
-    space.write(sp, &bytes)?;
+    space.load(sp, &bytes)?;
     Ok(sp)
 }

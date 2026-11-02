@@ -33,8 +33,9 @@ kern> crash
 | Timer | APIC timer calibrated against the PIT, 1000 Hz |
 | Multi-core | All CPUs run the kernel (Limine MP request), per-CPU GDT/TSS/idle task, panics stop every CPU |
 | Scheduler | Preemptive round-robin across all CPUs, 10 ms time slices, sleep, wait queues |
-| User mode | Ring 3 processes loaded from ELF files, `syscall`/`sysret` |
-| Syscalls | exit, write, read, getpid, sleep, yield, uptime, spawn, wait, try_wait, ps, sysinfo, list programs |
+| User mode | Ring 3 processes loaded from ELF files, `syscall`/`sysret`, arguments (argv) |
+| User memory | Demand-paged regions: `brk`, `mmap`/`munmap`/`mprotect`, 8 MiB stack; `Vec`/`String`/`Box` in user programs |
+| Syscalls | exit, write, read, getpid, sleep, yield, uptime, spawn, wait, try_wait, ps, sysinfo, list programs, brk, mmap, munmap, mprotect |
 | Faults | A crashing program is killed; the kernel keeps running |
 | Drivers | Framebuffer text console (with ANSI colours), PS/2 keyboard, buffered serial port |
 | User space | `ulib` (mini standard library), a shell (`init`) with command history, demo programs |
@@ -57,12 +58,12 @@ kern/
 │       ├── modules.rs  programs provided by the bootloader
 │       ├── sync.rs     SpinLock, IrqGuard
 │       ├── arch/       cpu, gdt, idt, interrupts, apic, percpu, smp
-│       ├── mm/         pmm (frames), vmm (page tables), heap, kstack
+│       ├── mm/         pmm (frames), vmm (page tables), uspace (process memory), heap, kstack
 │       ├── task/       scheduler, context switch, ELF loader
 │       └── drivers/    keyboard, serial
 ├── user/
 │   ├── linker.ld       user programs start at 0x400000
-│   ├── ulib/           syscalls, print!/println!, _start, panic handler
+│   ├── ulib/           syscalls, print!/println!, args, heap allocator, _start, panic handler
 │   ├── init/           the shell
 │   ├── hello/          prints with pauses (run several with `hello &`)
 │   ├── spin/           hogs the CPU to show preemption
@@ -128,10 +129,9 @@ Nothing is written to the internal disk; the kernel has no disk driver yet.
 1. **SMP, part 2:** per-CPU run queues instead of one shared queue, wake-up IPIs, TLB shootdown.
 2. **PCI enumeration** through ACPI MCFG; it's the gateway to every modern device.
 3. **Storage:** an NVMe or AHCI driver, then a VFS layer and a FAT32 filesystem, so programs can be loaded from disk instead of as boot modules.
-4. **User memory:** `mmap`/`brk` syscalls, then a heap allocator in `ulib`.
-5. **`fork`/`exec`, file descriptors, pipes**, enough to port a real libc later.
-6. **USB:** xHCI + HID keyboard.
-7. Reclaim bootloader memory, a buddy allocator for contiguous frames (needed for DMA).
+4. **`fork`/`exec`, file descriptors, pipes**, enough to port a real libc later.
+5. **USB:** xHCI + HID keyboard.
+6. Reclaim bootloader memory, a buddy allocator for contiguous frames (needed for DMA).
 
 ## Design notes
 

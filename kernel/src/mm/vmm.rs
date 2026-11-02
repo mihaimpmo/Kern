@@ -126,6 +126,49 @@ pub fn unmap(pml4: u64, virt: u64) -> Option<u64> {
     Some(phys)
 }
 
+/// Call `f(virt, entry)` for every present 4 KiB mapping in [start, end)
+/// (page-aligned, user half), skipping page tables that don't exist, so a
+/// huge sparse range costs only as much as what is mapped in it. `f` may
+/// rewrite or clear the entry; changed entries are flushed from this CPU's
+/// TLB. (Only this CPU: user page tables are loaded only on the CPU running
+/// their process.)
+pub fn update_range(pml4: u64, start: u64, end: u64, mut f: impl FnMut(u64, &mut u64)) {
+    debug_assert!(start % PAGE_SIZE == 0 && end % PAGE_SIZE == 0 && end <= USER_END);
+    let _lock = PT_LOCK.lock();
+    visit(pml4, 4, 0, start, end, &mut f);
+}
+
+fn visit(table_phys: u64, level: u32, base: u64, start: u64, end: u64, f: &mut dyn FnMut(u64, &mut u64)) {
+    let span = 1u64 << (12 + 9 * (level - 1)); // bytes covered by one entry
+    let first = start.saturating_sub(base) / span;
+    let last = ((end - 1).saturating_sub(base) / span).min(511);
+    for i in first..=last {
+        let lo = base + i * span;
+        let entry = &mut table(table_phys)[i as usize];
+        if *entry & PRESENT == 0 {
+            continue;
+        }
+        if level == 1 {
+            let old = *entry;
+            f(lo, entry);
+            if *entry != old {
+                unsafe { cpu::invlpg(lo) };
+            }
+        } else if *entry & HUGE == 0 {
+            visit(*entry & ADDR_MASK, level - 1, lo, start, end, f);
+        }
+    }
+}
+
+/// Final page-table flags for a leaf entry (drops NX if the CPU lacks it).
+pub fn leaf_flags(page_flags: u64) -> u64 {
+    fix_flags(page_flags | PRESENT)
+}
+
+pub fn entry_frame(entry: u64) -> u64 {
+    entry & ADDR_MASK
+}
+
 /// Translate a virtual address. Returns (physical address, entry flags).
 pub fn translate(pml4: u64, virt: u64) -> Option<(u64, u64)> {
     let _lock = PT_LOCK.lock();
@@ -184,24 +227,6 @@ impl AddressSpace {
         let kernel = table(kernel_pml4());
         table(pml4)[256..].copy_from_slice(&kernel[256..]);
         Some(Self { pml4 })
-    }
-
-    /// Allocate fresh zeroed frames for [virt, virt + size) with the given flags.
-    pub fn map_anonymous(&self, virt: u64, size: u64, page_flags: u64) -> Result<(), MapError> {
-        let start = super::align_down(virt, PAGE_SIZE);
-        let end = super::align_up(virt + size, PAGE_SIZE);
-        let mut page = start;
-        while page < end {
-            if translate(self.pml4, page).is_none() {
-                let frame = pmm::alloc_zeroed_frame().ok_or(MapError::OutOfMemory)?;
-                if let Err(e) = map(self.pml4, page, frame, page_flags | USER) {
-                    pmm::free_frame(frame);
-                    return Err(e);
-                }
-            }
-            page += PAGE_SIZE;
-        }
-        Ok(())
     }
 
     /// Copy `data` to `virt` in this address space, which need not be the

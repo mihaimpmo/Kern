@@ -18,9 +18,10 @@ mod elf;
 pub mod exec;
 
 use crate::arch::{cpu, percpu};
-use crate::mm::{kstack::KernelStack, vmm, vmm::AddressSpace};
+use crate::mm::uspace::{FaultResult, UserSpace};
+use crate::mm::{kstack::KernelStack, vmm};
 use crate::sync::{SpinLock, SpinLockGuard};
-use alloc::{boxed::Box, collections::BTreeMap, collections::VecDeque, string::String, vec::Vec};
+use alloc::{boxed::Box, collections::BTreeMap, collections::VecDeque, string::String, sync::Arc, vec::Vec};
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -47,7 +48,11 @@ pub struct Task {
     exit_code: i64,
     rsp: u64,
     kstack: Option<KernelStack>,
-    space: Option<AddressSpace>,
+    /// The process's memory (None for kernel threads). Locked separately
+    /// from the scheduler: syscalls and page faults use it for a long time.
+    space: Option<Arc<SpinLock<UserSpace>>>,
+    /// Page tables to load for this task: the space's, or the kernel's.
+    pml4: u64,
     wake_at: u64,
     user_entry: u64,
     user_stack: u64,
@@ -65,6 +70,7 @@ impl Task {
             rsp: 0,
             kstack: None,
             space: None,
+            pml4: vmm::kernel_pml4(),
             wake_at: 0,
             user_entry: 0,
             user_stack: 0,
@@ -235,7 +241,7 @@ pub fn add_cpu() {
     s.cpus.push(Cpu { current, idle, slice: TIME_SLICE_MS });
 }
 
-fn add_task(name: &str, parent: Option<Pid>, space: Option<AddressSpace>, entry: fn(u64), arg: u64) -> Option<Pid> {
+fn add_task(name: &str, parent: Option<Pid>, space: Option<UserSpace>, entry: fn(u64), arg: u64) -> Option<Pid> {
     let kstack = KernelStack::new()?;
     let rsp = prepare_stack(kstack.top(), entry, arg);
     let mut s = SCHED.lock();
@@ -244,7 +250,10 @@ fn add_task(name: &str, parent: Option<Pid>, space: Option<AddressSpace>, entry:
     let mut task = Box::new(Task::new(pid, name, parent));
     task.rsp = rsp;
     task.kstack = Some(kstack);
-    task.space = space;
+    if let Some(space) = space {
+        task.pml4 = space.pml4();
+        task.space = Some(Arc::new(SpinLock::new(space)));
+    }
     s.tasks.insert(pid, task);
     Some(pid)
 }
@@ -371,7 +380,7 @@ fn reap(s: &mut Scheduler) {
         }
         s.zombies.swap_remove(i);
         t.kstack = None; // back to the stack pool
-        t.space = None; // frees every page the process owned
+        t.space = None; // the last reference: frees every page the process owned
         let parent = t.parent;
         let orphan = parent.map_or(true, |p| s.tasks.get(&p).map_or(true, |t| t.state == State::Zombie));
         if orphan {
@@ -422,9 +431,8 @@ fn schedule(s: &mut SchedGuard) {
     if let Some(stack) = &next.kstack {
         percpu::set_kernel_stack(stack.top());
     }
-    let cr3 = next.space.as_ref().map_or(vmm::kernel_pml4(), |a| a.pml4);
-    if cpu::read_cr3() & !0xfff != cr3 {
-        unsafe { cpu::write_cr3(cr3) };
+    if cpu::read_cr3() & !0xfff != next.pml4 {
+        unsafe { cpu::write_cr3(next.pml4) };
     }
     s.cpus[index].current = next_ptr;
     let (prev_rsp, next_rsp) = (&mut prev.rsp as *mut u64, next.rsp);
@@ -483,6 +491,20 @@ pub fn uptime_ms() -> u64 {
 
 pub fn current_pid() -> Pid {
     SCHED.lock().current().pid
+}
+
+/// The running process's memory; None for kernel threads. Drop the result
+/// before exiting: a reference left on a dead task's stack is never dropped.
+pub fn current_space() -> Option<Arc<SpinLock<UserSpace>>> {
+    SCHED.lock().current().space.clone()
+}
+
+/// A page fault from user mode on a page that isn't mapped.
+pub fn user_page_fault(addr: u64, write: bool, exec: bool) -> FaultResult {
+    match current_space() {
+        Some(space) => space.lock().handle_fault(addr, write, exec),
+        None => FaultResult::Denied,
+    }
 }
 
 pub struct TaskInfo {

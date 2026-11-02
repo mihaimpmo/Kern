@@ -1,6 +1,7 @@
 //! Common interrupt entry path and dispatch.
 
 use super::{apic, cpu, percpu};
+use crate::mm::uspace::FaultResult;
 use crate::{drivers::keyboard, drivers::serial, task};
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -167,9 +168,21 @@ fn exception(frame: &mut InterruptFrame) {
     }
 
     if frame.from_user() {
+        let mut out_of_memory = false;
+        if frame.vector == 14 && frame.error & PF_PRESENT == 0 {
+            // Untouched memory the process may use: map it and retry.
+            let (write, exec) = (frame.error & PF_WRITE != 0, frame.error & PF_FETCH != 0);
+            match task::user_page_fault(cr2, write, exec) {
+                FaultResult::Handled => return,
+                FaultResult::NoMemory => out_of_memory = true,
+                FaultResult::Denied => {}
+            }
+        }
         // A user program faulted: kill it, the rest of the system keeps running.
         let pid = task::current_pid();
-        if frame.vector == 14 {
+        if out_of_memory {
+            kprintln!("\x1b[91m[kernel] process {} killed: out of memory at {:#x}\x1b[0m", pid, cr2);
+        } else if frame.vector == 14 {
             kprintln!(
                 "\x1b[91m[kernel] process {} killed: {} at {:#x} (address {:#x})\x1b[0m",
                 pid, name, frame.rip, cr2
@@ -189,8 +202,13 @@ fn exception(frame: &mut InterruptFrame) {
     panic!("{} in kernel at {:#x} (error {:#x})\n{:#x?}", name, frame.rip, frame.error, frame);
 }
 
+// Page-fault error code bits.
+const PF_PRESENT: u64 = 1 << 0;
+const PF_WRITE: u64 = 1 << 1;
+const PF_FETCH: u64 = 1 << 4;
+
 fn page_fault_reason(err: u64) -> &'static str {
-    match (err & 1 != 0, err & 2 != 0, err & 16 != 0) {
+    match (err & PF_PRESENT != 0, err & PF_WRITE != 0, err & PF_FETCH != 0) {
         (_, _, true) => "instruction fetch",
         (false, false, _) => "read of unmapped page",
         (false, true, _) => "write to unmapped page",

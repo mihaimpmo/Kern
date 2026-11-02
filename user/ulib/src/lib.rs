@@ -1,10 +1,13 @@
 //! ulib: the tiny standard library for Kern user programs.
 //!
 //! Programs define `#[no_mangle] fn main() -> i32` and get `print!`,
-//! `println!`, their arguments through `args()`, and safe wrappers around
-//! every system call. Fallible calls return `Result<_, Errno>`.
+//! `println!`, their arguments through `args()`, a heap (`extern crate
+//! alloc;` for `Vec`, `String`, `Box`), and safe wrappers around every system
+//! call. Fallible calls return `Result<_, Errno>`.
 
 #![no_std]
+
+pub mod heap;
 
 use core::arch::{asm, global_asm};
 use core::fmt;
@@ -25,6 +28,10 @@ pub mod sys {
     pub const SYSINFO: u64 = 10;
     pub const PS: u64 = 11;
     pub const TRY_WAIT: u64 = 12;
+    pub const BRK: u64 = 13;
+    pub const MMAP: u64 = 14;
+    pub const MUNMAP: u64 = 15;
+    pub const MPROTECT: u64 = 16;
 }
 
 /// Raw system call: number in rax, up to six arguments, result in rax.
@@ -62,6 +69,7 @@ impl Errno {
     pub const ECHILD: Errno = Errno(10);
     pub const ENOMEM: Errno = Errno(12);
     pub const EFAULT: Errno = Errno(14);
+    pub const EINVAL: Errno = Errno(22);
     pub const ENOSYS: Errno = Errno(38);
 
     pub fn name(self) -> &'static str {
@@ -73,6 +81,7 @@ impl Errno {
             10 => "no such child",
             12 => "out of memory",
             14 => "bad address",
+            22 => "invalid argument",
             38 => "not implemented",
             _ => "unknown error",
         }
@@ -173,6 +182,49 @@ pub fn write(fd: u64, bytes: &[u8]) -> Result<usize, Errno> {
 /// Blocks until at least one byte is available.
 pub fn read(fd: u64, buf: &mut [u8]) -> Result<usize, Errno> {
     check(unsafe { syscall(sys::READ, fd, buf.as_mut_ptr() as u64, buf.len() as u64) }).map(|n| n as usize)
+}
+
+// ------------------------------------------------------------------ memory
+
+/// Memory protection bits (Linux values).
+pub mod prot {
+    pub const NONE: u64 = 0;
+    pub const READ: u64 = 1;
+    pub const WRITE: u64 = 2;
+    pub const EXEC: u64 = 4;
+}
+
+const MAP_PRIVATE: u64 = 0x02;
+const MAP_FIXED: u64 = 0x10;
+const MAP_ANONYMOUS: u64 = 0x20;
+
+/// Move the end of the heap to `addr` (0 to ask where it is). Returns the
+/// new end; it stays where it was if the request can't be met.
+pub fn brk(addr: u64) -> u64 {
+    unsafe { syscall(sys::BRK, addr, 0, 0) as u64 }
+}
+
+/// `len` bytes of zeroed memory, mapped somewhere free. Pages are allocated
+/// when first touched.
+pub fn mmap(len: usize, prot: u64) -> Result<*mut u8, Errno> {
+    let flags = MAP_PRIVATE | MAP_ANONYMOUS;
+    check(unsafe { syscall6(sys::MMAP, 0, len as u64, prot, flags, 0, 0) }).map(|a| a as *mut u8)
+}
+
+/// Like `mmap`, but at exactly `addr`, replacing whatever was mapped there.
+pub fn mmap_fixed(addr: *mut u8, len: usize, prot: u64) -> Result<*mut u8, Errno> {
+    let flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
+    check(unsafe { syscall6(sys::MMAP, addr as u64, len as u64, prot, flags, 0, 0) }).map(|a| a as *mut u8)
+}
+
+/// # Safety
+/// Nothing may use the memory afterwards.
+pub unsafe fn munmap(addr: *mut u8, len: usize) -> Result<(), Errno> {
+    check(syscall(sys::MUNMAP, addr as u64, len as u64, 0)).map(|_| ())
+}
+
+pub fn mprotect(addr: *mut u8, len: usize, prot: u64) -> Result<(), Errno> {
+    check(unsafe { syscall(sys::MPROTECT, addr as u64, len as u64, prot) }).map(|_| ())
 }
 
 // ------------------------------------------------------------- system info

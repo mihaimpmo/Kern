@@ -10,6 +10,13 @@
 //!   4 sleep_ms(ms)         10 sysinfo(buf: *mut [u64; 5])
 //!   5 yield()              11 ps(buf, len) -> bytes
 //!                          12 try_wait(code: *mut i64) -> pid of a finished child, or 0
+//!  13 brk(addr) -> new end of the heap (0: query; unchanged on failure)
+//!  14 mmap(addr, len, prot, flags) -> addr     anonymous memory only
+//!  15 munmap(addr, len)
+//!  16 mprotect(addr, len, prot)
+//!
+//! PROT_* and MAP_* values are Linux's; `flags` must include MAP_PRIVATE |
+//! MAP_ANONYMOUS, and may add MAP_FIXED.
 //!
 //! `argv` points to `argc` (ptr, len) pairs: one string per argument, not
 //! NUL-terminated. The kernel passes them on in the usual C layout.
@@ -19,9 +26,9 @@
 
 use crate::arch::cpu::{self, msr, rdmsr, wrmsr};
 use crate::arch::{gdt, smp};
-use crate::mm::{pmm, vmm, PAGE_SIZE};
-use crate::sync::IrqGuard;
+use crate::mm::{pmm, vmm};
 use crate::{drivers::keyboard, drivers::serial, modules, task};
+use crate::mm::uspace::{MemError, Prot, UserSpace};
 use crate::task::exec;
 use alloc::{string::String, vec, vec::Vec};
 use core::arch::global_asm;
@@ -35,6 +42,7 @@ pub const ENOEXEC: i64 = -8;
 pub const EBADF: i64 = -9;
 pub const ECHILD: i64 = -10;
 pub const ENOMEM: i64 = -12;
+pub const EINVAL: i64 = -22;
 
 global_asm!(
     r#"
@@ -150,6 +158,10 @@ extern "C" fn syscall_dispatch(f: &mut SyscallFrame) {
         10 => sys_sysinfo(a0),
         11 => sys_ps(a0, a1),
         12 => sys_try_wait(a0),
+        13 => with_user_space(|s| s.brk(a0) as i64).unwrap_or(ENOMEM),
+        14 => sys_mmap(a0, a1, a2, a3),
+        15 => mem_result(with_user_space(|s| s.munmap(a0, a1).map(|()| 0))),
+        16 => sys_mprotect(a0, a1, a2),
         _ => ENOSYS,
     };
     f.rax = ret as u64;
@@ -161,30 +173,18 @@ extern "C" fn syscall_dispatch(f: &mut SyscallFrame) {
     f.rflags = (f.rflags & !0x3000) | 0x200; // IOPL 0, interrupts on
 }
 
-/// Check that [ptr, ptr+len) is mapped user memory (and writable, if asked).
-/// An empty range touches nothing, so any pointer is fine for it.
+/// Run `f` on the calling process's memory, locked (so interrupts are off).
+/// None for kernel threads, which have no user memory.
+fn with_user_space<R>(f: impl FnOnce(&mut UserSpace) -> R) -> Option<R> {
+    let space = task::current_space()?;
+    let mut space = space.lock();
+    Some(f(&mut space))
+}
+
+/// Check that [ptr, ptr + len) is memory the process may read (and write, if
+/// asked), mapping pages it hasn't touched yet. An empty range is always fine.
 fn user_range_ok(ptr: u64, len: u64, write: bool) -> bool {
-    if len == 0 {
-        return true;
-    }
-    let Some(end) = ptr.checked_add(len) else { return false };
-    if end > vmm::USER_END {
-        return false;
-    }
-    let pml4 = cpu::read_cr3() & !0xfff;
-    let mut page = ptr & !(PAGE_SIZE - 1);
-    while page < end {
-        match vmm::translate(pml4, page) {
-            Some((_, flags)) if flags & vmm::flags::USER != 0 => {
-                if write && flags & vmm::flags::WRITABLE == 0 {
-                    return false;
-                }
-            }
-            _ => return false,
-        }
-        page += PAGE_SIZE;
-    }
-    true
+    len == 0 || with_user_space(|s| s.populate(ptr, len, write).is_ok()).unwrap_or(false)
 }
 
 /// Fill `out` from user memory at `src`. Fails without copying anything if
@@ -193,16 +193,17 @@ fn copy_from_user(out: &mut [u8], src: u64) -> Result<(), ()> {
     if out.is_empty() {
         return Ok(());
     }
-    // Interrupts stay off across check and copy: nothing can change the
-    // mapping in between, and RFLAGS.AC can't leak into another task.
-    let _irq = IrqGuard::new();
-    if !user_range_ok(src, out.len() as u64, false) {
-        return Err(());
-    }
-    cpu::user_access_begin();
-    unsafe { core::ptr::copy_nonoverlapping(src as *const u8, out.as_mut_ptr(), out.len()) };
-    cpu::user_access_end();
-    Ok(())
+    // The address-space lock keeps interrupts off across check and copy:
+    // nothing can unmap the range in between, and RFLAGS.AC can't leak into
+    // another task.
+    with_user_space(|s| {
+        s.populate(src, out.len() as u64, false).map_err(|_| ())?;
+        cpu::user_access_begin();
+        unsafe { core::ptr::copy_nonoverlapping(src as *const u8, out.as_mut_ptr(), out.len()) };
+        cpu::user_access_end();
+        Ok(())
+    })
+    .unwrap_or(Err(()))
 }
 
 /// Copy `data` to user memory at `dst`, all or nothing.
@@ -210,14 +211,14 @@ fn copy_to_user(dst: u64, data: &[u8]) -> Result<(), ()> {
     if data.is_empty() {
         return Ok(());
     }
-    let _irq = IrqGuard::new();
-    if !user_range_ok(dst, data.len() as u64, true) {
-        return Err(());
-    }
-    cpu::user_access_begin();
-    unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), dst as *mut u8, data.len()) };
-    cpu::user_access_end();
-    Ok(())
+    with_user_space(|s| {
+        s.populate(dst, data.len() as u64, true).map_err(|_| ())?;
+        cpu::user_access_begin();
+        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), dst as *mut u8, data.len()) };
+        cpu::user_access_end();
+        Ok(())
+    })
+    .unwrap_or(Err(()))
 }
 
 /// Copy as much of `text` as fits in the user buffer; returns bytes copied.
@@ -333,6 +334,33 @@ fn sys_wait(pid: u64, code_ptr: u64) -> i64 {
         Ok(()) => 0,
         Err(()) => EFAULT,
     }
+}
+
+const MAP_PRIVATE: u64 = 0x02;
+const MAP_FIXED: u64 = 0x10;
+const MAP_ANONYMOUS: u64 = 0x20;
+
+fn mem_result(r: Option<Result<u64, MemError>>) -> i64 {
+    match r {
+        Some(Ok(v)) => v as i64,
+        Some(Err(MemError::Invalid)) => EINVAL,
+        Some(Err(MemError::Fault)) => EFAULT,
+        Some(Err(MemError::NoMemory)) | None => ENOMEM,
+    }
+}
+
+fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64) -> i64 {
+    let Some(prot) = Prot::from_bits(prot) else { return EINVAL };
+    if flags & !(MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS) != 0 || flags & (MAP_PRIVATE | MAP_ANONYMOUS) != (MAP_PRIVATE | MAP_ANONYMOUS) {
+        return EINVAL;
+    }
+    let fixed = (flags & MAP_FIXED != 0).then_some(addr);
+    mem_result(with_user_space(|s| s.mmap(fixed, len, prot)))
+}
+
+fn sys_mprotect(addr: u64, len: u64, prot: u64) -> i64 {
+    let Some(prot) = Prot::from_bits(prot) else { return EINVAL };
+    mem_result(with_user_space(|s| s.mprotect(addr, len, prot).map(|()| 0)))
 }
 
 fn sys_programs(buf: u64, len: u64) -> i64 {

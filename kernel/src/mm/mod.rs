@@ -2,8 +2,9 @@
 //!
 //! Virtual address space layout (4-level paging):
 //!
-//!   0x0000_0000_0040_0000  user program code (ELF)
-//!   0x0000_7fff_ffff_f000  top of user stack
+//!   0x0000_0000_0040_0000  user program code (ELF), then heap  } see
+//!   0x0000_1000_0000_0000  user mmap area                      } uspace.rs
+//!   0x0000_7fff_ffff_f000  top of user stack                   }
 //!   0xffff_8000_0000_0000  HHDM: all physical RAM, mapped by Limine
 //!   0xffff_d000_0000_0000  kernel heap (grows on demand)
 //!   0xffff_e000_0000_0000  kernel stacks (with unmapped guard pages)
@@ -13,6 +14,7 @@
 pub mod heap;
 pub mod kstack;
 pub mod pmm;
+pub mod uspace;
 pub mod vmm;
 
 use core::sync::atomic::{AtomicU64, Ordering};
