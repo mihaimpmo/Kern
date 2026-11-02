@@ -54,18 +54,26 @@ pub fn load(space: &AddressSpace, image: &[u8]) -> Result<u64, &'static str> {
     if h.entry >= vmm::USER_END {
         return Err("entry point outside user space");
     }
+    let ph_size = core::mem::size_of::<ProgramHeader>();
+    if h.phnum != 0 && (h.phentsize as usize) < ph_size {
+        return Err("bad program header table");
+    }
 
+    // All offsets and sizes come from the file, so every sum is checked.
+    let in_image = |offset: u64, len: u64| offset.checked_add(len).map_or(false, |end| end <= image.len() as u64);
     for i in 0..h.phnum as u64 {
-        let off = (h.phoff + i * h.phentsize as u64) as usize;
-        if off + core::mem::size_of::<ProgramHeader>() > image.len() {
-            return Err("bad program header table");
-        }
+        let off = (h.phentsize as u64).checked_mul(i).and_then(|o| o.checked_add(h.phoff));
+        let off = match off {
+            Some(off) if in_image(off, ph_size as u64) => off as usize,
+            _ => return Err("bad program header table"),
+        };
         let ph: ProgramHeader = unsafe { read_unaligned(image.as_ptr().add(off) as *const ProgramHeader) };
         if ph.kind != PT_LOAD || ph.memsz == 0 {
             continue;
         }
         let end = ph.vaddr.checked_add(ph.memsz).ok_or("segment overflows")?;
-        if end > vmm::USER_END || ph.filesz > ph.memsz || ph.offset + ph.filesz > image.len() as u64 {
+        // Page 0 stays unmapped so null pointers in user programs fault.
+        if ph.vaddr < PAGE_SIZE || end > vmm::USER_END || ph.filesz > ph.memsz || !in_image(ph.offset, ph.filesz) {
             return Err("bad segment");
         }
 

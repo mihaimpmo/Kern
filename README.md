@@ -23,6 +23,7 @@ kern> crash
 |---|---|
 | Boot | Limine protocol (base revision 5), one hybrid ISO for UEFI + BIOS |
 | CPU setup | GDT, TSS, IDT, 256 interrupt stubs, separate stacks (IST) for double fault / NMI / machine check |
+| Hardening | SMEP, SMAP and UMIP when the CPU has them; user memory is only touched through checked copies |
 | Physical memory | Free-list frame allocator built from the firmware memory map |
 | Virtual memory | 4-level paging, one address space per process, shared kernel half, NX |
 | Kernel heap | Grows on demand (`Vec`, `Box`, `String` all work in the kernel) |
@@ -33,8 +34,8 @@ kern> crash
 | User mode | Ring 3 processes loaded from ELF files, `syscall`/`sysret` |
 | Syscalls | exit, write, read, getpid, sleep, yield, uptime, spawn, wait, try_wait, ps, sysinfo, list programs |
 | Faults | A crashing program is killed; the kernel keeps running |
-| Drivers | Framebuffer text console (with ANSI colours), PS/2 keyboard, serial port |
-| User space | `ulib` (mini standard library), a shell (`init`), demo programs |
+| Drivers | Framebuffer text console (with ANSI colours), PS/2 keyboard, buffered serial port |
+| User space | `ulib` (mini standard library), a shell (`init`) with command history, demo programs |
 
 ## Project layout
 
@@ -111,7 +112,7 @@ Nothing is written to the internal disk; the kernel has no disk driver yet.
 
 **Add a user program:** copy `user/hello`, add it to `members` in `user/Cargo.toml`, `PROGRAMS` in the Makefile, and a `module_path` line in `limine.conf`. The shell can then run it by name.
 
-**Add a system call:** add a number and a `sys_*` function in `kernel/src/syscall.rs`, and a wrapper in `user/ulib/src/lib.rs`. Always validate user pointers with `user_slice` / `user_slice_mut`.
+**Add a system call:** add a number and a `sys_*` function in `kernel/src/syscall.rs`, and a wrapper in `user/ulib/src/lib.rs`. Only touch user memory through `copy_from_user` / `copy_to_user`; with SMAP on, anything else faults.
 
 **Add a kernel thread:** `task::spawn_kernel("name", function, arg)`.
 

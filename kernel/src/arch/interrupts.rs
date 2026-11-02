@@ -1,8 +1,9 @@
 //! Common interrupt entry path and dispatch.
 
 use super::{apic, cpu};
-use crate::{drivers::keyboard, task};
+use crate::{drivers::keyboard, drivers::serial, task};
 use core::arch::global_asm;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 pub const VECTOR_TIMER: u64 = 0x20;
 pub const VECTOR_KEYBOARD: u64 = 0x21;
@@ -113,6 +114,8 @@ extern "C" fn interrupt_dispatch(frame: &mut InterruptFrame) {
         0..=31 => exception(frame),
         VECTOR_TIMER => {
             apic::eoi();
+            serial::poll();
+            report_nmis();
             task::timer_tick();
         }
         VECTOR_KEYBOARD => {
@@ -128,9 +131,35 @@ extern "C" fn interrupt_dispatch(frame: &mut InterruptFrame) {
     }
 }
 
+/// NMIs received so far, and how many of them have been reported.
+static NMI_COUNT: AtomicU64 = AtomicU64::new(0);
+static NMI_REPORTED: AtomicU64 = AtomicU64::new(0);
+
+/// An NMI can arrive while any lock is held (it ignores IF), so the handler
+/// only counts it; the timer interrupt, which never runs inside a locked
+/// section, prints the message.
+fn report_nmis() {
+    let count = NMI_COUNT.load(Ordering::Relaxed);
+    if count != NMI_REPORTED.load(Ordering::Relaxed) {
+        NMI_REPORTED.store(count, Ordering::Relaxed);
+        kprintln!("\x1b[93m[kernel] NMI received ({} so far), ignored\x1b[0m", count);
+    }
+}
+
 fn exception(frame: &mut InterruptFrame) {
     let name = EXCEPTIONS[frame.vector as usize];
     let cr2 = cpu::read_cr2();
+
+    match frame.vector {
+        // Not caused by the code that was running, so never kill it for this.
+        2 => {
+            NMI_COUNT.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        // Hardware error or a broken kernel: stop, whichever mode we came from.
+        8 | 18 => panic!("{} at {:#x} (error {:#x})\n{:#x?}", name, frame.rip, frame.error, frame),
+        _ => {}
+    }
 
     if frame.from_user() {
         // A user program faulted: kill it, the rest of the system keeps running.

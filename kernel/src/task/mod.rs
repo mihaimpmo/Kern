@@ -267,12 +267,21 @@ pub fn exit_current(code: i64) -> ! {
     let s = sched();
     let pid = s.current;
     assert!(pid != 0, "idle task tried to exit");
-    // Orphan our children; they will be cleaned up when they exit.
-    for t in s.tasks.values_mut() {
-        if t.parent == Some(pid) {
-            t.parent = None;
+    // Orphan our children. A child still running, or exited but not yet
+    // reaped, is removed by `reap` once it has no parent. A child that was
+    // already reaped is only waiting for us to collect its exit code, which
+    // will now never happen, so drop its entry here.
+    let zombies = &s.zombies;
+    s.tasks.retain(|_, t| {
+        if t.parent != Some(pid) {
+            return true;
         }
-    }
+        if t.state == State::Zombie && !zombies.contains(&t.pid) {
+            return false;
+        }
+        t.parent = None;
+        true
+    });
     let t = s.tasks.get_mut(&pid).unwrap();
     t.state = State::Zombie;
     t.exit_code = code;
@@ -440,7 +449,7 @@ pub fn sleep_ms(ms: u64) {
     let s = sched();
     let pid = s.current;
     let t = s.tasks.get_mut(&pid).unwrap();
-    t.wake_at = uptime_ms() + ms.max(1);
+    t.wake_at = uptime_ms().saturating_add(ms.max(1));
     t.state = State::Sleeping;
     s.sleeping.push(pid);
     schedule();

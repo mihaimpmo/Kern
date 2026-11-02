@@ -1,6 +1,7 @@
 //! Thin wrappers around x86-64 instructions.
 
 use core::arch::asm;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 #[inline]
 pub unsafe fn outb(port: u16, value: u8) {
@@ -63,6 +64,18 @@ pub unsafe fn write_cr3(v: u64) {
 }
 
 #[inline]
+pub fn read_cr4() -> u64 {
+    let v: u64;
+    unsafe { asm!("mov {}, cr4", out(reg) v, options(nomem, nostack, preserves_flags)) };
+    v
+}
+
+#[inline]
+pub unsafe fn write_cr4(v: u64) {
+    asm!("mov cr4, {}", in(reg) v, options(nostack, preserves_flags));
+}
+
+#[inline]
 pub unsafe fn invlpg(addr: u64) {
     asm!("invlpg [{}]", in(reg) addr, options(nostack, preserves_flags));
 }
@@ -122,4 +135,67 @@ pub fn brand_string(buf: &mut [u8; 48]) -> &str {
     }
     let len = buf.iter().position(|&b| b == 0).unwrap_or(48);
     core::str::from_utf8(&buf[..len]).unwrap_or("unknown CPU").trim()
+}
+
+// ------------------------------------------------------------- protections
+
+const CR4_UMIP: u64 = 1 << 11;
+const CR4_SMEP: u64 = 1 << 20;
+const CR4_SMAP: u64 = 1 << 21;
+
+static SMAP: AtomicBool = AtomicBool::new(false);
+
+/// Which of the optional protections `enable_protections` turned on.
+pub struct Protections {
+    pub smep: bool,
+    pub smap: bool,
+    pub umip: bool,
+}
+
+/// Turn on the CPU features that stop the kernel from being tricked by user
+/// memory, where the CPU has them:
+/// - SMEP: the kernel faults if it ever executes a user page.
+/// - SMAP: the kernel faults if it touches a user page outside
+///   `user_access_begin`/`user_access_end` (see `syscall::copy_from_user`).
+/// - UMIP: user mode can't read GDT/IDT/TSS addresses (sgdt, sidt, ...).
+pub fn enable_protections() -> Protections {
+    let max_leaf = cpuid(0, 0).eax;
+    let (ebx, ecx) = if max_leaf >= 7 {
+        let r = cpuid(7, 0);
+        (r.ebx, r.ecx)
+    } else {
+        (0, 0)
+    };
+    let p = Protections { smep: ebx & (1 << 7) != 0, smap: ebx & (1 << 20) != 0, umip: ecx & (1 << 2) != 0 };
+    let mut cr4 = read_cr4();
+    if p.smep {
+        cr4 |= CR4_SMEP;
+    }
+    if p.smap {
+        cr4 |= CR4_SMAP;
+    }
+    if p.umip {
+        cr4 |= CR4_UMIP;
+    }
+    unsafe { write_cr4(cr4) };
+    SMAP.store(p.smap, Ordering::Relaxed);
+    p
+}
+
+/// Allow kernel access to user pages (sets RFLAGS.AC). Only valid with
+/// interrupts off: RFLAGS is not saved by `switch_context`, so AC must not be
+/// carried into another task.
+#[inline]
+pub fn user_access_begin() {
+    debug_assert!(!interrupts_enabled());
+    if SMAP.load(Ordering::Relaxed) {
+        unsafe { asm!("stac", options(nomem, nostack)) };
+    }
+}
+
+#[inline]
+pub fn user_access_end() {
+    if SMAP.load(Ordering::Relaxed) {
+        unsafe { asm!("clac", options(nomem, nostack)) };
+    }
 }

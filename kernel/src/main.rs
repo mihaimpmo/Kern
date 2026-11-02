@@ -1,8 +1,9 @@
 //! Kern: a small monolithic x86-64 kernel.
 //!
-//! Boot order: serial -> framebuffer console -> GDT/IDT -> physical memory ->
-//! paging -> heap -> ACPI/APIC -> timer -> syscalls -> scheduler ->
-//! keyboard -> first user program (`init`).
+//! Boot order: serial -> framebuffer console -> GDT/IDT -> SMEP/SMAP/UMIP ->
+//! physical memory -> paging -> heap -> ACPI/APIC -> timer -> syscalls ->
+//! scheduler -> keyboard -> first user program (`init`) -> buffered serial
+//! output -> idle loop.
 
 #![no_std]
 #![no_main]
@@ -50,6 +51,19 @@ extern "C" fn kmain() -> ! {
     gdt::init();
     idt::init();
     ok("GDT, TSS and IDT loaded");
+
+    let prot = cpu::enable_protections();
+    let flag = |on: bool, name: &'static str| if on { name } else { "" };
+    if prot.smep || prot.smap || prot.umip {
+        ok(format_args!(
+            "user-memory protection:{}{}{}",
+            flag(prot.smep, " SMEP"),
+            flag(prot.smap, " SMAP"),
+            flag(prot.umip, " UMIP")
+        ));
+    } else {
+        kprintln!("\x1b[93m[warn]\x1b[0m CPU has no SMEP/SMAP/UMIP; relying on syscall pointer checks only");
+    }
 
     let memmap = boot::MEMMAP.response().expect("no memory map from bootloader");
     mm::pmm::init(memmap);
@@ -100,6 +114,11 @@ extern "C" fn kmain() -> ! {
     }
     kprintln!();
 
+    // Interrupts come on in the idle loop, so the timer can drain buffered
+    // serial output from here on. Until now it was written synchronously, so
+    // a boot that hangs still shows everything up to the hang.
+    drivers::serial::start_buffering();
+
     // This boot thread becomes the idle task.
     task::idle();
 }
@@ -111,6 +130,7 @@ fn ok(msg: impl core::fmt::Display) {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     cpu::cli();
+    drivers::serial::panic_mode();
     console::_panic_print(format_args!("\n\x1b[91m*** KERNEL PANIC ***\x1b[0m\n"));
     if let Some(loc) = info.location() {
         console::_panic_print(format_args!("at {}:{}\n", loc.file(), loc.line()));

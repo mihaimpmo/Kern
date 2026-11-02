@@ -69,9 +69,13 @@ pub fn spawn(name: &str) -> i64 {
     unsafe { syscall3(sys::SPAWN, name.as_ptr() as u64, name.len() as u64, 0) }
 }
 
-/// Wait for a child to finish; returns its exit code.
-pub fn wait(pid: u64) -> i64 {
-    unsafe { syscall3(sys::WAIT, pid, 0, 0) }
+/// Wait for a child to finish: Some(exit code), or None if `pid` is not a
+/// child of this process. (Exit codes can be negative, so they are returned
+/// through a pointer rather than mixed with error numbers.)
+pub fn wait(pid: u64) -> Option<i64> {
+    let mut code: i64 = 0;
+    let ret = unsafe { syscall3(sys::WAIT, pid, &mut code as *mut i64 as u64, 0) };
+    (ret == 0).then_some(code)
 }
 
 /// Collect a finished child without blocking: Some((pid, exit code)).

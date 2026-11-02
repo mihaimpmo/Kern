@@ -5,16 +5,20 @@
 //!
 //!   0 exit(code)            6 uptime_ms()
 //!   1 write(fd, buf, len)   7 spawn(name, name_len) -> pid
-//!   2 read(fd, buf, len)    8 wait(pid) -> exit code
+//!   2 read(fd, buf, len)    8 wait(pid, code: *mut i64) -> 0
 //!   3 getpid()              9 programs(buf, len) -> bytes
 //!   4 sleep_ms(ms)         10 sysinfo(buf: *mut [u64; 4])
 //!   5 yield()              11 ps(buf, len) -> bytes
 //!                          12 try_wait(code: *mut i64) -> pid of a finished child, or 0
+//!
+//! User memory is only ever touched through `copy_from_user` / `copy_to_user`,
+//! which check the pages and open the SMAP window around the copy.
 
 use crate::arch::cpu::{self, msr, rdmsr, wrmsr};
 use crate::arch::gdt;
 use crate::mm::{pmm, vmm, PAGE_SIZE};
-use crate::{drivers::keyboard, modules, task};
+use crate::sync::IrqGuard;
+use crate::{drivers::keyboard, drivers::serial, modules, task};
 use alloc::string::String;
 use core::arch::global_asm;
 use core::fmt::Write;
@@ -22,6 +26,7 @@ use core::fmt::Write;
 pub const ENOSYS: i64 = -38;
 pub const EFAULT: i64 = -14;
 pub const ENOENT: i64 = -2;
+pub const ENOEXEC: i64 = -8;
 pub const EBADF: i64 = -9;
 pub const ECHILD: i64 = -10;
 pub const ENOMEM: i64 = -12;
@@ -134,7 +139,7 @@ extern "C" fn syscall_dispatch(f: &mut SyscallFrame) {
         }
         6 => task::uptime_ms() as i64,
         7 => sys_spawn(a0, a1),
-        8 => task::wait(a0).unwrap_or(ECHILD),
+        8 => sys_wait(a0, a1),
         9 => sys_programs(a0, a1),
         10 => sys_sysinfo(a0),
         11 => sys_ps(a0, a1),
@@ -172,27 +177,74 @@ fn user_range_ok(ptr: u64, len: u64, write: bool) -> bool {
     true
 }
 
-fn user_slice(ptr: u64, len: u64) -> Option<&'static [u8]> {
-    user_range_ok(ptr, len, false).then(|| unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) })
+/// Fill `out` from user memory at `src`. Fails without copying anything if
+/// any byte of the range isn't readable user memory.
+fn copy_from_user(out: &mut [u8], src: u64) -> Result<(), ()> {
+    if out.is_empty() {
+        return Ok(());
+    }
+    // Interrupts stay off across check and copy: nothing can change the
+    // mapping in between, and RFLAGS.AC can't leak into another task.
+    let _irq = IrqGuard::new();
+    if !user_range_ok(src, out.len() as u64, false) {
+        return Err(());
+    }
+    cpu::user_access_begin();
+    unsafe { core::ptr::copy_nonoverlapping(src as *const u8, out.as_mut_ptr(), out.len()) };
+    cpu::user_access_end();
+    Ok(())
 }
 
-fn user_slice_mut(ptr: u64, len: u64) -> Option<&'static mut [u8]> {
-    user_range_ok(ptr, len, true).then(|| unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len as usize) })
+/// Copy `data` to user memory at `dst`, all or nothing.
+fn copy_to_user(dst: u64, data: &[u8]) -> Result<(), ()> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    let _irq = IrqGuard::new();
+    if !user_range_ok(dst, data.len() as u64, true) {
+        return Err(());
+    }
+    cpu::user_access_begin();
+    unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), dst as *mut u8, data.len()) };
+    cpu::user_access_end();
+    Ok(())
 }
 
+/// Copy as much of `text` as fits in the user buffer; returns bytes copied.
 fn copy_out(text: &str, buf: u64, len: u64) -> i64 {
-    let Some(out) = user_slice_mut(buf, len) else { return EFAULT };
-    let n = text.len().min(out.len());
-    out[..n].copy_from_slice(&text.as_bytes()[..n]);
-    n as i64
+    let n = (text.len() as u64).min(len) as usize;
+    match copy_to_user(buf, &text.as_bytes()[..n]) {
+        Ok(()) => n as i64,
+        Err(()) => EFAULT,
+    }
 }
+
+/// Bytes handed to the console per lock acquisition. The console lock keeps
+/// interrupts off, so a big write is split up to let the timer and keyboard in.
+const WRITE_CHUNK: usize = 256;
 
 fn sys_write(fd: u64, buf: u64, len: u64) -> i64 {
     if fd != 1 && fd != 2 {
         return EBADF;
     }
-    let Some(bytes) = user_slice(buf, len) else { return EFAULT };
-    crate::console::write_bytes(bytes);
+    if !user_range_ok(buf, len, false) {
+        return EFAULT;
+    }
+    let mut chunk = [0u8; WRITE_CHUNK];
+    let mut done = 0;
+    while done < len {
+        let n = (len - done).min(WRITE_CHUNK as u64) as usize;
+        if copy_from_user(&mut chunk[..n], buf + done).is_err() {
+            return if done > 0 { done as i64 } else { EFAULT };
+        }
+        // Let the serial buffer drain instead of making the console fall
+        // back to slow synchronous output (+ n for the '\r' added per '\n').
+        while !serial::has_room(2 * n) {
+            task::sleep_ms(1);
+        }
+        crate::console::write_bytes(&chunk[..n]);
+        done += n as u64;
+    }
     len as i64
 }
 
@@ -200,17 +252,44 @@ fn sys_read(fd: u64, buf: u64, len: u64) -> i64 {
     if fd != 0 {
         return EBADF;
     }
-    let Some(out) = user_slice_mut(buf, len) else { return EFAULT };
-    keyboard::read(out) as i64
+    // Check before blocking, so keys are never consumed and then lost.
+    if !user_range_ok(buf, len, true) {
+        return EFAULT;
+    }
+    let mut keys = [0u8; 256];
+    let n = keyboard::read(&mut keys[..(len as usize).min(256)]);
+    match copy_to_user(buf, &keys[..n]) {
+        Ok(()) => n as i64,
+        Err(()) => EFAULT,
+    }
 }
 
 fn sys_spawn(name: u64, len: u64) -> i64 {
-    let Some(bytes) = user_slice(name, len.min(256)) else { return EFAULT };
+    let mut buf = [0u8; 256];
+    let Some(bytes) = buf.get_mut(..len as usize) else { return ENOENT };
+    if copy_from_user(bytes, name).is_err() {
+        return EFAULT;
+    }
     let Ok(name) = core::str::from_utf8(bytes) else { return ENOENT };
     let Some(image) = modules::find(name) else { return ENOENT };
     match task::spawn_user(name, image, Some(task::current_pid())) {
         Ok(pid) => pid as i64,
-        Err(_) => ENOMEM,
+        Err(why) => {
+            kprintln!("\x1b[91m[kernel] cannot start {}: {}\x1b[0m", name, why);
+            if why == "out of memory" { ENOMEM } else { ENOEXEC }
+        }
+    }
+}
+
+fn sys_wait(pid: u64, code_ptr: u64) -> i64 {
+    // Check first: once the child is collected its exit code can't be put back.
+    if !user_range_ok(code_ptr, 8, true) {
+        return EFAULT;
+    }
+    let Some(code) = task::wait(pid) else { return ECHILD };
+    match copy_to_user(code_ptr, &code.to_le_bytes()) {
+        Ok(()) => 0,
+        Err(()) => EFAULT,
     }
 }
 
@@ -224,13 +303,16 @@ fn sys_programs(buf: u64, len: u64) -> i64 {
 }
 
 fn sys_sysinfo(buf: u64) -> i64 {
-    let Some(out) = user_slice_mut(buf, 32) else { return EFAULT };
     let (free, total) = pmm::stats();
     let fields = [total, free, task::uptime_ms(), task::list().len() as u64];
+    let mut out = [0u8; 32];
     for (i, v) in fields.iter().enumerate() {
         out[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
     }
-    0
+    match copy_to_user(buf, &out) {
+        Ok(()) => 0,
+        Err(()) => EFAULT,
+    }
 }
 
 fn sys_ps(buf: u64, len: u64) -> i64 {
@@ -248,10 +330,10 @@ fn sys_try_wait(code_ptr: u64) -> i64 {
         return EFAULT;
     }
     match task::try_wait_any() {
-        Some((pid, code)) => {
-            unsafe { (code_ptr as *mut i64).write_unaligned(code) };
-            pid as i64
-        }
+        Some((pid, code)) => match copy_to_user(code_ptr, &code.to_le_bytes()) {
+            Ok(()) => pid as i64,
+            Err(()) => EFAULT,
+        },
         None => 0,
     }
 }
