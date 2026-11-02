@@ -17,6 +17,7 @@
 mod elf;
 pub mod exec;
 
+use crate::arch::fpu::FpuState;
 use crate::arch::{cpu, percpu};
 use crate::mm::uspace::{FaultResult, UserSpace};
 use crate::mm::{kstack::KernelStack, vmm};
@@ -53,6 +54,8 @@ pub struct Task {
     space: Option<Arc<SpinLock<UserSpace>>>,
     /// Page tables to load for this task: the space's, or the kernel's.
     pml4: u64,
+    /// Saved x87/SSE registers, for user tasks (the kernel doesn't use them).
+    fpu: Option<Box<FpuState>>,
     wake_at: u64,
     user_entry: u64,
     user_stack: u64,
@@ -71,6 +74,7 @@ impl Task {
             kstack: None,
             space: None,
             pml4: vmm::kernel_pml4(),
+            fpu: None,
             wake_at: 0,
             user_entry: 0,
             user_stack: 0,
@@ -253,6 +257,7 @@ fn add_task(name: &str, parent: Option<Pid>, space: Option<UserSpace>, entry: fn
     if let Some(space) = space {
         task.pml4 = space.pml4();
         task.space = Some(Arc::new(SpinLock::new(space)));
+        task.fpu = Some(FpuState::new());
     }
     s.tasks.insert(pid, task);
     Some(pid)
@@ -433,6 +438,14 @@ fn schedule(s: &mut SchedGuard) {
     }
     if cpu::read_cr3() & !0xfff != next.pml4 {
         unsafe { cpu::write_cr3(next.pml4) };
+    }
+    // The kernel never uses these registers, so swapping them here, before
+    // the stack switch, is the same as doing it on the way to user mode.
+    if let Some(fpu) = prev.fpu.as_mut() {
+        fpu.save();
+    }
+    if let Some(fpu) = next.fpu.as_ref() {
+        fpu.restore();
     }
     s.cpus[index].current = next_ptr;
     let (prev_rsp, next_rsp) = (&mut prev.rsp as *mut u64, next.rsp);

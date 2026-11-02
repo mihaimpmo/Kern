@@ -50,6 +50,18 @@ pub mod msr {
 }
 
 #[inline]
+pub fn read_cr0() -> u64 {
+    let v: u64;
+    unsafe { asm!("mov {}, cr0", out(reg) v, options(nomem, nostack, preserves_flags)) };
+    v
+}
+
+#[inline]
+pub unsafe fn write_cr0(v: u64) {
+    asm!("mov cr0, {}", in(reg) v, options(nostack, preserves_flags));
+}
+
+#[inline]
 pub fn read_cr2() -> u64 {
     let v: u64;
     unsafe { asm!("mov {}, cr2", out(reg) v, options(nomem, nostack, preserves_flags)) };

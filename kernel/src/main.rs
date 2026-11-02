@@ -1,6 +1,6 @@
 //! Kern: a small monolithic x86-64 kernel.
 //!
-//! Boot order: serial -> framebuffer console -> boot GDT + IDT ->
+//! Boot order: serial -> framebuffer console -> boot GDT + IDT -> FPU ->
 //! SMEP/SMAP/UMIP -> physical memory -> paging -> heap -> per-CPU GDT/TSS ->
 //! ACPI/APIC -> timer -> syscalls -> scheduler -> other CPUs -> keyboard ->
 //! first user program (`init`) -> buffered serial output -> idle loop.
@@ -54,6 +54,8 @@ extern "C" fn kmain() -> ! {
     gdt::load_boot_gdt();
     idt::init();
 
+    arch::fpu::init_cpu();
+    arch::fpu::init();
     let prot = cpu::enable_protections();
     let flag = |on: bool, name: &'static str| if on { name } else { "" };
     if prot.smep || prot.smap || prot.umip {

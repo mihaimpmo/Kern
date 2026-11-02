@@ -75,6 +75,23 @@ fn main() -> i32 {
             }
             (black_box(&v).iter().map(|&b| b as usize).sum::<usize>() != v.len() / 4096) as i32
         }
+        ["float", scale] => float_work(scale.parse().unwrap_or(1)),
+        ["mxcsr"] => {
+            // Round toward zero; it must survive other processes using the
+            // default rounding mode on the same CPUs.
+            let set: u32 = 0x7f80;
+            unsafe { core::arch::asm!("ldmxcsr [{}]", in(reg) &set) };
+            let end = ulib::uptime_ms() + 300;
+            while ulib::uptime_ms() < end {
+                ulib::sleep_ms(1);
+                for _ in 0..10_000 {
+                    core::hint::spin_loop();
+                }
+            }
+            let mut now: u32 = 0;
+            unsafe { core::arch::asm!("stmxcsr [{}]", in(reg) &mut now) };
+            (now != set) as i32
+        }
         ["orphan"] => {
             // Our child finishes (and is cleaned up) while we are alive; then
             // we exit without waiting for it.
@@ -241,6 +258,16 @@ fn multicore(t: &mut Suite) {
     }
     check!(t, "spawn storm: 8 x 24 concurrent children", all_ok);
 
+    // Floating point in several processes at once (register state is saved
+    // per task), plus one with a non-default SSE control register.
+    let mut pids = [0; 5];
+    for (i, pid) in pids.iter_mut().enumerate() {
+        let r = if i == 4 { ulib::spawn(NAME, &["mxcsr"]) } else { ulib::spawn(NAME, &["float", ["1", "2", "3", "5"][i]]) };
+        *pid = r.unwrap_or(0);
+    }
+    let codes = pids.map(|pid| ulib::wait(pid));
+    check!(t, "SSE state is per process", codes.iter().all(|c| *c == Ok(0)), "exit codes {:?}", codes);
+
     if cpus < 2 {
         return;
     }
@@ -259,6 +286,30 @@ fn multicore(t: &mut Suite) {
     let limit = 150 * (n + 1);
     println!("# {} x 300 ms of busy work took {} ms on {} CPUs", n, took, cpus);
     check!(t, "busy processes run in parallel", took < limit, "{} x 300 ms took {} ms (limit {})", n, took, limit);
+}
+
+/// Busy floating-point work for ~300 ms, preempted many times. Every partial
+/// sum is an integer below 2^53, so the result is exact and known: if any
+/// switch lost or mixed up SSE registers, it comes out wrong.
+fn float_work(scale: u64) -> i32 {
+    let factor = scale as f64;
+    let mut acc = 0.0f64;
+    let mut n: u64 = 0;
+    let end = ulib::uptime_ms() + 300;
+    while ulib::uptime_ms() < end {
+        for _ in 0..100_000 {
+            acc += black_box((n % 1000) as f64) * factor;
+            n += 1;
+        }
+    }
+    let full = n / 1000;
+    let expected = scale * (full * 499_500 + (0..n % 1000).sum::<u64>());
+    if acc == expected as f64 {
+        0
+    } else {
+        println!("  float {}: {} iterations gave {}, expected {}", scale, n, acc, expected);
+        1
+    }
 }
 
 /// About 4 KiB of stack per level.

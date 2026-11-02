@@ -1,13 +1,10 @@
+# User programs are built for Kern's own target (x86_64-kern-user.json):
+# like x86_64-unknown-none, but with SSE floating point, which the kernel
+# saves and restores per task. The kernel itself stays soft-float.
 [build]
-target = "x86_64-unknown-none"
+target = "x86_64-kern-user.json"
 
 [unstable]
+json-target-spec = true
 build-std = ["core", "alloc", "compiler_builtins"]
 build-std-features = ["compiler-builtins-mem"]
-
-[target.x86_64-unknown-none]
-rustflags = [
-    
-    "-C", "relocation-model=static",
-    
-]

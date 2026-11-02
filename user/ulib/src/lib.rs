@@ -255,16 +255,40 @@ pub fn sysinfo() -> SysInfo {
 
 // ------------------------------------------------------------------ printing
 
-pub struct Stdout;
+/// Collects formatted output and sends it in as few `write` calls as
+/// possible, so a line printed by one process isn't split up by another
+/// process printing at the same time on another CPU.
+struct Buffered {
+    buf: [u8; 256],
+    len: usize,
+}
 
-impl fmt::Write for Stdout {
+impl Buffered {
+    fn flush(&mut self) {
+        if self.len > 0 {
+            let _ = write(STDOUT, &self.buf[..self.len]);
+            self.len = 0;
+        }
+    }
+}
+
+impl fmt::Write for Buffered {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        write(STDOUT, s.as_bytes()).map(|_| ()).map_err(|_| fmt::Error)
+        for chunk in s.as_bytes().chunks(self.buf.len()) {
+            if self.len + chunk.len() > self.buf.len() {
+                self.flush();
+            }
+            self.buf[self.len..self.len + chunk.len()].copy_from_slice(chunk);
+            self.len += chunk.len();
+        }
+        Ok(())
     }
 }
 
 pub fn _print(args: fmt::Arguments) {
-    let _ = fmt::Write::write_fmt(&mut Stdout, args);
+    let mut out = Buffered { buf: [0; 256], len: 0 };
+    let _ = fmt::Write::write_fmt(&mut out, args);
+    out.flush();
 }
 
 #[macro_export]

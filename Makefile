@@ -13,7 +13,7 @@ TEST_CMDLINE   := init=selftest qemu-exit
 export RUSTC_BOOTSTRAP := 1
 
 KERNEL   := kernel/target/x86_64-unknown-none/release/kern
-USER_DIR := user/target/x86_64-unknown-none/release
+USER_DIR := user/target/x86_64-kern-user/release
 OVMF     ?= $(firstword $(wildcard /usr/share/ovmf/OVMF.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/x64/OVMF.4m.fd /usr/share/OVMF/OVMF_CODE_4M.fd))
 
 .PHONY: all kernel user iso run run-uefi test clean distclean

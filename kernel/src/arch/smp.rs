@@ -7,7 +7,7 @@
 //! GDT and page tables and interrupts off, and sets itself up the way `kmain`
 //! set up the boot CPU. Its boot thread then becomes its idle task.
 
-use super::{apic, cpu, idt, percpu};
+use super::{apic, cpu, fpu, idt, percpu};
 use crate::boot::{self, MpInfo};
 use crate::{mm::vmm, syscall, task};
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -53,6 +53,7 @@ extern "C" fn ap_entry(info: &'static MpInfo) -> ! {
     percpu::init(index); // our GDT first: the IDT refers to its selectors
     idt::load();
     cpu::enable_protections();
+    fpu::init_cpu();
     apic::init_local();
     syscall::init();
     task::add_cpu();

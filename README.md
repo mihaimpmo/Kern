@@ -34,6 +34,7 @@ kern> crash
 | Multi-core | All CPUs run the kernel (Limine MP request), per-CPU GDT/TSS/idle task, panics stop every CPU |
 | Scheduler | Preemptive round-robin across all CPUs, 10 ms time slices, sleep, wait queues |
 | User mode | Ring 3 processes loaded from ELF files, `syscall`/`sysret`, arguments (argv) |
+| Floating point | SSE in user programs, register state saved per task |
 | User memory | Demand-paged regions: `brk`, `mmap`/`munmap`/`mprotect`, 8 MiB stack; `Vec`/`String`/`Box` in user programs |
 | Syscalls | exit, write, read, getpid, sleep, yield, uptime, spawn, wait, try_wait, ps, sysinfo, list programs, brk, mmap, munmap, mprotect |
 | Faults | A crashing program is killed; the kernel keeps running |
@@ -94,7 +95,7 @@ make run-uefi   # test in QEMU, UEFI
 make test       # automated tests in QEMU (needs python3)
 ```
 
-The Makefile sets `RUSTC_BOOTSTRAP=1` so a stable Rust toolchain can rebuild `core`/`alloc` for the bare-metal target. With a nightly toolchain that variable is unnecessary.
+The Makefile sets `RUSTC_BOOTSTRAP=1` so a stable Rust toolchain can rebuild `core`/`alloc` for the bare-metal targets. With a nightly toolchain that variable is unnecessary. The kernel is built for `x86_64-unknown-none`; user programs for `user/x86_64-kern-user.json`, the same target with SSE floating point enabled.
 
 ## Booting on a real computer
 
